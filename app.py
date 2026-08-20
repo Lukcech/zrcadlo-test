@@ -5,7 +5,7 @@ import json
 import sqlite3
 import uuid
 from qdrant_client import QdrantClient
-from qdrant_client.models import PointStruct, VectorParams, Distance
+from qdrant_client.models import PointStruct
 
 API_KEY = "AQ.Ab8RN6LcRITU_9D9RMh8jYDkFLPLLgVantVqKGzDhnpmxrzZbw"
 DB_PATH = "./qdrant_db"
@@ -70,22 +70,29 @@ with st.sidebar:
 
 # --- POMOCNÉ FUNKCE PRO AUTOMATICKOU PAMĚŤ ---
 def ziskej_embedding(text):
-    url_models = f"https://generativelanguage.googleapis.com/v1beta/models?key={API_KEY}"
-    resp_m = requests.get(url_models).json()
-    emb_model = next((m["name"] for m in resp_m.get("models", []) if "embedContent" in m.get("supportedGenerationMethods", [])), "models/gemini-embedding-001")
-    url_emb = f"https://generativelanguage.googleapis.com/v1beta/{emb_model}:embedContent?key={API_KEY}"
-    r = requests.post(url_emb, json={"model": emb_model, "content": {"parts": [{"text": text}]}}, headers={"Content-Type": "application/json"})
-    return r.json()["embedding"]["values"]
+    """Stabilní získání vektoru s ošetřením chyb."""
+    url_emb = f"https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key={API_KEY}"
+    try:
+        r = requests.post(url_emb, json={"model": "models/text-embedding-004", "content": {"parts": [{"text": text}]}}, headers={"Content-Type": "application/json"})
+        res = r.json()
+        if "embedding" in res and "values" in res["embedding"]:
+            return res["embedding"]["values"]
+    except Exception:
+        pass
+    return None
 
 def ziskej_kontext(dotaz, user_id):
     vektor = ziskej_embedding(dotaz)
-    client = QdrantClient(path=DB_PATH)
-    try:
-        q_res = client.query_points(collection_name="zrcadlo_pamet", query=vektor, limit=10).points
-        vektory_text = [hit.payload.get('text', '') for hit in q_res if hit.payload.get('user_id', 'karel') == user_id][:3]
-    except Exception:
-        vektory_text = []
-    client.close()
+    vektory_text = []
+    
+    if vektor:
+        client = QdrantClient(path=DB_PATH)
+        try:
+            q_res = client.query_points(collection_name="zrcadlo_pamet", query=vektor, limit=10).points
+            vektory_text = [hit.payload.get('text', '') for hit in q_res if hit.payload.get('user_id', 'karel') == user_id][:3]
+        except Exception:
+            vektory_text = []
+        client.close()
 
     conn = sqlite3.connect(GRAPH_DB_PATH)
     cursor = conn.cursor()
@@ -96,11 +103,10 @@ def ziskej_kontext(dotaz, user_id):
     return vektory_text, graf_res
 
 def uc_se_z_zpravy(zprava, user_id):
-    """Extrahujeme fakta a graf na pozadí chatu a ukládáme nové vzpomínky."""
     url_gen = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key={API_KEY}"
     prompt = f"""
-Pokud zpráva obsahuje trvalé osobní fakta, preference, vztahy nebo tělesné/psychické prožitky, vyextrahuj je.
-Pokud zpráva neobsahuje žádná nová fakta (jen pozdrav, dotaz apod.), vrať prázdná pole.
+Pokud zpráva obsahuje trvalé osobní fakta, preference, plánované akce nebo tělesné/psychické prožitky, vyextrahuj je.
+Pokud zpráva neobsahuje žádná nová fakta, vrať prázdná pole.
 
 Vrať JSON:
 - facts: pole věcných tvrzení o uživateli (3. osoba)
@@ -134,38 +140,42 @@ Zpráva:
             }
         }
     }
-    r = requests.post(url_gen, json=payload, headers={"Content-Type": "application/json"})
-    if r.status_code != 200:
-        return
+    try:
+        r = requests.post(url_gen, json=payload, headers={"Content-Type": "application/json"})
+        if r.status_code != 200:
+            return
 
-    data = json.loads(r.json()['candidates'][0]['content']['parts'][0]['text'])
-    fakta = data.get("facts", [])
-    trojice = data.get("triples", [])
+        data = json.loads(r.json()['candidates'][0]['content']['parts'][0]['text'])
+        fakta = data.get("facts", [])
+        trojice = data.get("triples", [])
 
-    # 1. Uložení vektorů do Qdrant
-    if fakta:
-        client = QdrantClient(path=DB_PATH)
-        for f in fakta:
-            v = ziskej_embedding(f)
-            client.upsert(
-                collection_name="zrcadlo_pamet",
-                points=[PointStruct(id=str(uuid.uuid4()), vector=v, payload={"text": f, "user_id": user_id})]
-            )
-        client.close()
+        # 1. Uložení vektorů do Qdrant
+        if fakta:
+            client = QdrantClient(path=DB_PATH)
+            for f in fakta:
+                v = ziskej_embedding(f)
+                if v:
+                    client.upsert(
+                        collection_name="zrcadlo_pamet",
+                        points=[PointStruct(id=str(uuid.uuid4()), vector=v, payload={"text": f, "user_id": user_id})]
+                    )
+            client.close()
 
-    # 2. Uložení grafu do SQLite
-    if trojice:
-        conn = sqlite3.connect(GRAPH_DB_PATH)
-        cursor = conn.cursor()
-        for t in trojice:
-            sub, rel, obj = t.get('subject','').lower().strip(), t.get('relation','').lower().strip(), t.get('object','').lower().strip()
-            if sub and rel and obj:
-                try:
-                    cursor.execute("INSERT INTO triples (user_id, subject, relation, object) VALUES (?, ?, ?, ?)", (user_id, sub, rel, obj))
-                except sqlite3.IntegrityError:
-                    pass
-        conn.commit()
-        conn.close()
+        # 2. Uložení grafu do SQLite
+        if trojice:
+            conn = sqlite3.connect(GRAPH_DB_PATH)
+            cursor = conn.cursor()
+            for t in trojice:
+                sub, rel, obj = t.get('subject','').lower().strip(), t.get('relation','').lower().strip(), t.get('object','').lower().strip()
+                if sub and rel and obj:
+                    try:
+                        cursor.execute("INSERT INTO triples (user_id, subject, relation, object) VALUES (?, ?, ?, ?)", (user_id, sub, rel, obj))
+                    except sqlite3.IntegrityError:
+                        pass
+            conn.commit()
+            conn.close()
+    except Exception:
+        pass
 
 def generuj_odpoved(dotaz, vektory, graf, user_id):
     prompt = f"""
@@ -204,13 +214,9 @@ if user_input := st.chat_input(f"Napiš zprávu pro Zrcadlo..."):
 
     with st.chat_message("assistant"):
         with st.spinner("Zrcadlo přemýšlí a ukládá poznatky..."):
-            # 1. Získání paměti & odpoved
             vektory, graf = ziskej_kontext(user_input, active_user)
             odpoved = generuj_odpoved(user_input, vektory, graf, active_user)
-            
-            # 2. Autonomní učení z nové zprávy
             uc_se_z_zpravy(user_input, active_user)
-            
             st.write(odpoved)
 
     st.session_state.messages.append({"role": "assistant", "content": odpoved})
