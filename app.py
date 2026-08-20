@@ -5,7 +5,7 @@ import json
 import sqlite3
 import uuid
 from qdrant_client import QdrantClient
-from qdrant_client.models import PointStruct
+from qdrant_client.models import PointStruct, VectorParams, Distance
 
 API_KEY = "AQ.Ab8RN6LcRITU_9D9RMh8jYDkFLPLLgVantVqKGzDhnpmxrzZbw"
 DB_PATH = "./qdrant_db"
@@ -13,25 +13,40 @@ GRAPH_DB_PATH = "znalostni_graf.db"
 
 st.set_page_config(page_title="Projekt Zrcadlo", page_icon="🪞", layout="wide")
 
-# --- DB INICIALIZACE A MIGRACE ---
-conn = sqlite3.connect(GRAPH_DB_PATH)
-cursor = conn.cursor()
-cursor.execute("PRAGMA table_info(triples)")
-columns = [col[1] for col in cursor.fetchall()]
+# --- AUTOMATICKÁ INICIALIZACE DATABÁZÍ ---
+def init_databases():
+    # 1. SQLite
+    conn = sqlite3.connect(GRAPH_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(triples)")
+    columns = [col[1] for col in cursor.fetchall()]
+    if not columns:
+        cursor.execute('''
+            CREATE TABLE triples (
+                user_id TEXT DEFAULT 'karel',
+                subject TEXT, relation TEXT, object TEXT,
+                UNIQUE(user_id, subject, relation, object)
+            )
+        ''')
+    elif "user_id" not in columns:
+        cursor.execute("ALTER TABLE triples ADD COLUMN user_id TEXT DEFAULT 'karel'")
+    conn.commit()
+    conn.close()
 
-if not columns:
-    cursor.execute('''
-        CREATE TABLE triples (
-            user_id TEXT DEFAULT 'karel',
-            subject TEXT, relation TEXT, object TEXT,
-            UNIQUE(user_id, subject, relation, object)
-        )
-    ''')
-elif "user_id" not in columns:
-    cursor.execute("ALTER TABLE triples ADD COLUMN user_id TEXT DEFAULT 'karel'")
+    # 2. Qdrant (vytvoření kolekce, pokud neexistuje)
+    try:
+        client = QdrantClient(path=DB_PATH)
+        collections = [c.name for c in client.get_collections().collections]
+        if "zrcadlo_pamet" not in collections:
+            client.create_collection(
+                collection_name="zrcadlo_pamet",
+                vectors_config=VectorParams(size=768, distance=Distance.COSINE)
+            )
+        client.close()
+    except Exception:
+        pass
 
-conn.commit()
-conn.close()
+init_databases()
 
 # --- BOČNÍ PANEL ---
 with st.sidebar:
@@ -41,10 +56,11 @@ with st.sidebar:
     st.caption(f"Živý náhled paměti pro: **{active_user}**")
 
     # Qdrant počítadlo
+    pocet_vektoru = 0
     try:
         client = QdrantClient(path=DB_PATH)
         all_points = client.scroll(collection_name="zrcadlo_pamet", limit=200)[0]
-        user_points = [p for p in all_points if p.payload.get("user_id", "karel") == active_user]
+        user_points = [p for p in all_points if p.payload and p.payload.get("user_id", "karel") == active_user]
         pocet_vektoru = len(user_points)
         client.close()
     except Exception:
@@ -68,9 +84,8 @@ with st.sidebar:
         else:
             st.info("Tento uživatel nemá v grafu žádné vazby.")
 
-# --- POMOCNÉ FUNKCE PRO AUTOMATICKOU PAMĚŤ ---
+# --- POMOCNÉ FUNKCE ---
 def ziskej_embedding(text):
-    """Stabilní získání vektoru s ošetřením chyb."""
     url_emb = f"https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key={API_KEY}"
     try:
         r = requests.post(url_emb, json={"model": "models/text-embedding-004", "content": {"parts": [{"text": text}]}}, headers={"Content-Type": "application/json"})
@@ -86,13 +101,13 @@ def ziskej_kontext(dotaz, user_id):
     vektory_text = []
     
     if vektor:
-        client = QdrantClient(path=DB_PATH)
         try:
+            client = QdrantClient(path=DB_PATH)
             q_res = client.query_points(collection_name="zrcadlo_pamet", query=vektor, limit=10).points
-            vektory_text = [hit.payload.get('text', '') for hit in q_res if hit.payload.get('user_id', 'karel') == user_id][:3]
+            vektory_text = [hit.payload.get('text', '') for hit in q_res if hit.payload and hit.payload.get('user_id', 'karel') == user_id][:3]
+            client.close()
         except Exception:
             vektory_text = []
-        client.close()
 
     conn = sqlite3.connect(GRAPH_DB_PATH)
     cursor = conn.cursor()
@@ -103,7 +118,7 @@ def ziskej_kontext(dotaz, user_id):
     return vektory_text, graf_res
 
 def uc_se_z_zpravy(zprava, user_id):
-    url_gen = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key={API_KEY}"
+    url_gen = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={API_KEY}"
     prompt = f"""
 Pokud zpráva obsahuje trvalé osobní fakta, preference, plánované akce nebo tělesné/psychické prožitky, vyextrahuj je.
 Pokud zpráva neobsahuje žádná nová fakta, vrať prázdná pole.
@@ -149,7 +164,6 @@ Zpráva:
         fakta = data.get("facts", [])
         trojice = data.get("triples", [])
 
-        # 1. Uložení vektorů do Qdrant
         if fakta:
             client = QdrantClient(path=DB_PATH)
             for f in fakta:
@@ -161,7 +175,6 @@ Zpráva:
                     )
             client.close()
 
-        # 2. Uložení grafu do SQLite
         if trojice:
             conn = sqlite3.connect(GRAPH_DB_PATH)
             cursor = conn.cursor()
@@ -192,9 +205,13 @@ GRAFOVÉ VAZBY:
 
 Odpověz přátelsky, přímo a s pochopením.
 """
-    url_gen = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key={API_KEY}"
-    r = requests.post(url_gen, json={"contents": [{"parts": [{"text": prompt}]}]}, headers={"Content-Type": "application/json"})
-    return r.json()['candidates'][0]['content']['parts'][0]['text']
+    url_gen = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={API_KEY}"
+    try:
+        r = requests.post(url_gen, json={"contents": [{"parts": [{"text": prompt}]}]}, headers={"Content-Type": "application/json"})
+        res = r.json()
+        return res['candidates'][0]['content']['parts'][0]['text']
+    except Exception as e:
+        return "Omlouvám se, dočasně se nepodařilo spojit s AI generátorem."
 
 # --- HLAVNÍ CHAT ROZHRANÍ ---
 st.title("🪞 Zrcadlo")
