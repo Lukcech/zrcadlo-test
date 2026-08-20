@@ -124,6 +124,7 @@ def ziskej_embedding(text):
         vysledek = genai_client.models.embed_content(
             model=EMBED_MODEL,
             contents=text,
+            config=types.EmbedContentConfig(output_dimensionality=768),
         )
         return vysledek.embeddings[0].values
     except Exception as e:
