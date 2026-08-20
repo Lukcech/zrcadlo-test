@@ -7,7 +7,7 @@ import uuid
 from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct, VectorParams, Distance
 
-API_KEY = "AQ.Ab8RN6LcRITU_9D9RMh8jYDkFLPLLgVantVqKGzDhnpmxrzZbw"
+API_KEY = "AIzaSyAb8RN6LcRITU_9D9RMh8jYDkFLPLLgVantVqKGzDhnpmxrzZbw"
 DB_PATH = "./qdrant_db"
 GRAPH_DB_PATH = "znalostni_graf.db"
 
