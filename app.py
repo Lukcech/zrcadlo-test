@@ -18,6 +18,8 @@ DB_PATH = "./qdrant_db"
 GRAPH_DB_PATH = "znalostni_graf.db"
 GEN_MODEL = "gemini-3.1-flash-lite"
 EMBED_MODEL = "gemini-embedding-001"
+QDRANT_COLLECTION = "zrcadlo_pamet"
+EMBED_DIM = 768
 
 
 def nacti_api_klic():
@@ -50,6 +52,51 @@ def vytvor_qdrant_client() -> QdrantClient:
         pass
 
     return QdrantClient(path=DB_PATH)
+
+
+def zajisti_kolekci(client: QdrantClient) -> None:
+    """Vytvoří kolekci zrcadlo_pamet, pokud ještě neexistuje."""
+    existuje = False
+    try:
+        if hasattr(client, "collection_exists"):
+            existuje = client.collection_exists(collection_name=QDRANT_COLLECTION)
+        else:
+            jmena = [c.name for c in client.get_collections().collections]
+            existuje = QDRANT_COLLECTION in jmena
+    except Exception:
+        existuje = False
+
+    if not existuje:
+        client.create_collection(
+            collection_name=QDRANT_COLLECTION,
+            vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
+        )
+
+
+def je_chyba_404(exc: Exception) -> bool:
+    """True, pokud výjimka vypadá jako chybějící kolekce (404 / Not Found)."""
+    kod = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    text = str(exc).lower()
+    return kod == 404 or "404" in text or "not found" in text or "doesn't exist" in text
+
+
+def qdrant_operace(fn):
+    """
+    Spustí operaci nad Qdrantem: předem zajistí kolekci,
+    při 404 ji znovu vytvoří a operaci jednou zopakuje.
+    """
+    client = vytvor_qdrant_client()
+    try:
+        zajisti_kolekci(client)
+        try:
+            return fn(client)
+        except Exception as e:
+            if je_chyba_404(e):
+                zajisti_kolekci(client)
+                return fn(client)
+            raise
+    finally:
+        client.close()
 
 
 def aktualni_razitko() -> str:
@@ -120,11 +167,14 @@ with st.sidebar:
     st.caption(f"Živý náhled paměti pro: **{active_user}**")
 
     try:
-        client = vytvor_qdrant_client()
-        all_points = client.scroll(collection_name="zrcadlo_pamet", limit=200)[0]
-        user_points = [p for p in all_points if p.payload.get("user_id", "karel") == active_user]
+        def _nacti_body(client):
+            return client.scroll(collection_name=QDRANT_COLLECTION, limit=200)[0]
+
+        all_points = qdrant_operace(_nacti_body)
+        user_points = [
+            p for p in all_points if p.payload.get("user_id", "karel") == active_user
+        ]
         pocet_vektoru = len(user_points)
-        client.close()
     except Exception:
         pocet_vektoru = 0
 
@@ -155,7 +205,7 @@ def ziskej_embedding(text):
         vysledek = genai_client.models.embed_content(
             model=EMBED_MODEL,
             contents=text,
-            config=types.EmbedContentConfig(output_dimensionality=768),
+            config=types.EmbedContentConfig(output_dimensionality=EMBED_DIM),
         )
         return vysledek.embeddings[0].values
     except Exception as e:
@@ -168,13 +218,15 @@ def ziskej_kontext(dotaz, user_id):
     except Exception as e:
         raise RuntimeError(formatuj_chybu(e)) from e
 
-    client = vytvor_qdrant_client()
     try:
-        q_res = client.query_points(
-            collection_name="zrcadlo_pamet",
-            query=vektor,
-            limit=10,
-        ).points
+        def _hledej(client):
+            return client.query_points(
+                collection_name=QDRANT_COLLECTION,
+                query=vektor,
+                limit=10,
+            ).points
+
+        q_res = qdrant_operace(_hledej)
         vektory_text = [
             hit.payload.get("text", "")
             for hit in q_res
@@ -182,8 +234,6 @@ def ziskej_kontext(dotaz, user_id):
         ][:3]
     except Exception:
         vektory_text = []
-    finally:
-        client.close()
 
     conn = sqlite3.connect(GRAPH_DB_PATH)
     cursor = conn.cursor()
@@ -247,24 +297,23 @@ Zpráva:
     trojice = data.get("triples", [])
 
     if fakta:
-        client = vytvor_qdrant_client()
-        try:
-            razitko = aktualni_razitko()
-            for f in fakta:
-                text_s_casem = f"[{razitko}] {f}"
-                v = ziskej_embedding(text_s_casem)
-                client.upsert(
-                    collection_name="zrcadlo_pamet",
-                    points=[
-                        PointStruct(
-                            id=str(uuid.uuid4()),
-                            vector=v,
-                            payload={"text": text_s_casem, "user_id": user_id},
-                        )
-                    ],
+        razitko = aktualni_razitko()
+        body = []
+        for f in fakta:
+            text_s_casem = f"[{razitko}] {f}"
+            v = ziskej_embedding(text_s_casem)
+            body.append(
+                PointStruct(
+                    id=str(uuid.uuid4()),
+                    vector=v,
+                    payload={"text": text_s_casem, "user_id": user_id},
                 )
-        finally:
-            client.close()
+            )
+
+        def _uloz(client):
+            client.upsert(collection_name=QDRANT_COLLECTION, points=body)
+
+        qdrant_operace(_uloz)
 
     if trojice:
         conn = sqlite3.connect(GRAPH_DB_PATH)
