@@ -3,6 +3,7 @@ import json
 import os
 import sqlite3
 import uuid
+from datetime import datetime
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -35,6 +36,36 @@ def nacti_api_klic():
         "API_KEY nebyl nalezen. Nastav ho v .streamlit/secrets.toml "
         "nebo v souboru .env (API_KEY=...)."
     )
+
+
+def vytvor_qdrant_client() -> QdrantClient:
+    """Připojení k Qdrant Cloudu ze secrets, jinak lokální ./qdrant_db."""
+    try:
+        if "QDRANT_URL" in st.secrets and "QDRANT_API_KEY" in st.secrets:
+            return QdrantClient(
+                url=st.secrets["QDRANT_URL"],
+                api_key=st.secrets["QDRANT_API_KEY"],
+            )
+    except Exception:
+        pass
+
+    return QdrantClient(path=DB_PATH)
+
+
+def aktualni_razitko() -> str:
+    """Aktuální datum a čas ve formátu DD.MM.YYYY HH:MM."""
+    return datetime.now().strftime("%d.%m.%Y %H:%M")
+
+
+def formatuj_historii_chatu(zpravy, limit=5) -> str:
+    """Sestaví text posledních zpráv z aktuálního chatu."""
+    if not zpravy:
+        return "Žádná předchozí konverzace v této relaci."
+    casti = []
+    for msg in zpravy[-limit:]:
+        role = "Uživatel" if msg.get("role") == "user" else "Zrcadlo"
+        casti.append(f"{role}: {msg.get('content', '')}")
+    return "\n".join(casti)
 
 
 def formatuj_chybu(exc: Exception) -> str:
@@ -89,7 +120,7 @@ with st.sidebar:
     st.caption(f"Živý náhled paměti pro: **{active_user}**")
 
     try:
-        client = QdrantClient(path=DB_PATH)
+        client = vytvor_qdrant_client()
         all_points = client.scroll(collection_name="zrcadlo_pamet", limit=200)[0]
         user_points = [p for p in all_points if p.payload.get("user_id", "karel") == active_user]
         pocet_vektoru = len(user_points)
@@ -137,7 +168,7 @@ def ziskej_kontext(dotaz, user_id):
     except Exception as e:
         raise RuntimeError(formatuj_chybu(e)) from e
 
-    client = QdrantClient(path=DB_PATH)
+    client = vytvor_qdrant_client()
     try:
         q_res = client.query_points(
             collection_name="zrcadlo_pamet",
@@ -216,17 +247,19 @@ Zpráva:
     trojice = data.get("triples", [])
 
     if fakta:
-        client = QdrantClient(path=DB_PATH)
+        client = vytvor_qdrant_client()
         try:
+            razitko = aktualni_razitko()
             for f in fakta:
-                v = ziskej_embedding(f)
+                text_s_casem = f"[{razitko}] {f}"
+                v = ziskej_embedding(text_s_casem)
                 client.upsert(
                     collection_name="zrcadlo_pamet",
                     points=[
                         PointStruct(
                             id=str(uuid.uuid4()),
                             vector=v,
-                            payload={"text": f, "user_id": user_id},
+                            payload={"text": text_s_casem, "user_id": user_id},
                         )
                     ],
                 )
@@ -252,25 +285,34 @@ Zpráva:
         conn.close()
 
 
-def generuj_odpoved(dotaz, vektory, graf, user_id):
+def generuj_odpoved(dotaz, vektory, graf, user_id, historie_chatu):
     prompt = f"""
-Jsi Zrcadlo, empatický AI průvodce uživatele '{user_id}'. Odpovídáš na základě jeho vzpomínek.
+Jsi Zrcadlo, empatický AI průvodce uživatele '{user_id}'.
+
+PRAVIDLA:
+- Vycházej primárně ze zadaných faktů: vektorových vzpomínek, grafových vazeb a historie chatu.
+- Nevymýšlej si nepodložené detaily, události, jména ani pocity, které v podkladech nejsou.
+- Pokud něco nevíš, otevřeně to řekni. Nehalucinuj.
+- Na začátku vzpomínek může být časové razítko [DD.MM.YYYY HH:MM] — ber ho v potaz.
+- Odpovídej přátelsky, přímo a s pochopením a plynule navazuj na krátkodobou historii chatu.
 
 DOTAZ UŽIVATELE ({user_id}):
 {dotaz}
+
+KRÁTKODOBÁ PAMĚŤ (poslední zprávy tohoto chatu):
+{formatuj_historii_chatu(historie_chatu, limit=5)}
 
 VEKTOROVÉ VZPOMÍNKY:
 {chr(10).join(vektory) if vektory else "Žádné předchozí vzpomínky."}
 
 GRAFOVÉ VAZBY:
 {chr(10).join(graf) if graf else "Žádné předchozí grafové vazby."}
-
-Odpověz přátelsky, přímo a s pochopením.
 """
     try:
         odpoved = genai_client.models.generate_content(
             model=GEN_MODEL,
             contents=prompt,
+            config=types.GenerateContentConfig(temperature=0.2),
         )
         return odpoved.text
     except Exception as e:
@@ -281,15 +323,19 @@ Odpověz přátelsky, přímo a s pochopením.
 st.title("🪞 Zrcadlo")
 st.subheader(f"Konverzace pro uživatele: :blue[{active_user}]")
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+if "chat_historie" not in st.session_state:
+    st.session_state.chat_historie = {}
+if active_user not in st.session_state.chat_historie:
+    st.session_state.chat_historie[active_user] = []
 
-for msg in st.session_state.messages:
+zpravy = st.session_state.chat_historie[active_user]
+
+for msg in zpravy:
     with st.chat_message(msg["role"]):
         st.write(msg["content"])
 
 if user_input := st.chat_input("Napiš zprávu pro Zrcadlo..."):
-    st.session_state.messages.append({"role": "user", "content": user_input})
+    zpravy.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.write(user_input)
 
@@ -297,7 +343,14 @@ if user_input := st.chat_input("Napiš zprávu pro Zrcadlo..."):
         with st.spinner("Zrcadlo přemýšlí a ukládá poznatky..."):
             try:
                 vektory, graf = ziskej_kontext(user_input, active_user)
-                odpoved = generuj_odpoved(user_input, vektory, graf, active_user)
+                historie_pro_prompt = zpravy[:-1]
+                odpoved = generuj_odpoved(
+                    user_input,
+                    vektory,
+                    graf,
+                    active_user,
+                    historie_pro_prompt,
+                )
                 try:
                     uc_se_z_zpravy(user_input, active_user)
                 except Exception as e:
@@ -308,5 +361,5 @@ if user_input := st.chat_input("Napiš zprávu pro Zrcadlo..."):
                 odpoved = formatuj_chybu(e)
                 st.error(odpoved)
 
-    st.session_state.messages.append({"role": "assistant", "content": odpoved})
+    zpravy.append({"role": "assistant", "content": odpoved})
     st.rerun()
