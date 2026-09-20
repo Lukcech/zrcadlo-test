@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from qdrant_client import QdrantClient
+from qdrant_client.http import models
 from qdrant_client.models import Distance, PointStruct, VectorParams
 
 load_dotenv()
@@ -148,7 +149,7 @@ def nacti_vzpominky_uzivatele(user_id: str) -> list:
                 if p.payload.get("user_id", "karel") == user_id:
                     zaznamy.append(
                         {
-                            "id": str(p.id),
+                            "id": p.id,
                             "text": p.payload.get("text", ""),
                             "user_id": p.payload.get("user_id", user_id),
                         }
@@ -162,6 +163,28 @@ def nacti_vzpominky_uzivatele(user_id: str) -> list:
         return qdrant_operace(_scroll_all)
     except Exception:
         return []
+
+
+def smaz_vzpominku(point_id) -> None:
+    """Smaže jeden vektor z Qdrantu podle point.id."""
+
+    def _delete(client):
+        client.delete(
+            collection_name=QDRANT_COLLECTION,
+            points_selector=models.PointIdsList(points=[point_id]),
+        )
+
+    qdrant_operace(_delete)
+
+
+def rozdel_razitko_a_text(text: str):
+    """Oddělí [DD.MM.YYYY HH:MM] od zbytku vzpomínky, pokud je přítomné."""
+    if text.startswith("[") and "]" in text:
+        konec = text.find("]")
+        razitko = text[1:konec]
+        zbytek = text[konec + 1 :].lstrip()
+        return razitko, zbytek
+    return "—", text
 
 
 st.set_page_config(page_title="Projekt Zrcadlo", page_icon="🪞", layout="wide")
@@ -248,7 +271,14 @@ with st.sidebar:
         "user_id": active_user,
         "exported_at": datetime.now().isoformat(timespec="seconds"),
         "count": len(user_vzpominky),
-        "memories": user_vzpominky,
+        "memories": [
+            {
+                "id": str(z["id"]),
+                "text": z.get("text", ""),
+                "user_id": z.get("user_id", active_user),
+            }
+            for z in user_vzpominky
+        ],
     }
     st.download_button(
         label="Stáhnout mé vzpomínky (JSON)",
@@ -448,48 +478,74 @@ GRAFOVÉ VAZBY:
         raise RuntimeError(formatuj_chybu(e)) from e
 
 
-# --- HLAVNÍ CHAT ROZHRANÍ ---
+# --- HLAVNÍ ROZHRANÍ ---
 st.title("🪞 Zrcadlo")
-st.subheader(f"Konverzace pro uživatele: :blue[{active_user}] · režim: :blue[{rezim}]")
+st.subheader(f"Uživatel: :blue[{active_user}] · režim: :blue[{rezim}]")
 
-if "chat_historie" not in st.session_state:
-    st.session_state.chat_historie = {}
-if active_user not in st.session_state.chat_historie:
-    st.session_state.chat_historie[active_user] = []
+tab_chat, tab_pamet = st.tabs(["💬 Chat", "🧠 Správa paměti"])
 
-zpravy = st.session_state.chat_historie[active_user]
+with tab_chat:
+    if "chat_historie" not in st.session_state:
+        st.session_state.chat_historie = {}
+    if active_user not in st.session_state.chat_historie:
+        st.session_state.chat_historie[active_user] = []
 
-for msg in zpravy:
-    with st.chat_message(msg["role"]):
-        st.write(msg["content"])
+    zpravy = st.session_state.chat_historie[active_user]
 
-if user_input := st.chat_input("Napiš zprávu pro Zrcadlo..."):
-    zpravy.append({"role": "user", "content": user_input})
-    with st.chat_message("user"):
-        st.write(user_input)
+    for msg in zpravy:
+        with st.chat_message(msg["role"]):
+            st.write(msg["content"])
 
-    with st.chat_message("assistant"):
-        with st.spinner("Zrcadlo přemýšlí a ukládá poznatky..."):
-            try:
-                vektory, graf = ziskej_kontext(user_input, active_user)
-                historie_pro_prompt = zpravy[:-1]
-                odpoved = generuj_odpoved(
-                    user_input,
-                    vektory,
-                    graf,
-                    active_user,
-                    historie_pro_prompt,
-                    rezim,
-                )
+    if user_input := st.chat_input("Napiš zprávu pro Zrcadlo..."):
+        zpravy.append({"role": "user", "content": user_input})
+        with st.chat_message("user"):
+            st.write(user_input)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Zrcadlo přemýšlí a ukládá poznatky..."):
                 try:
-                    uc_se_z_zpravy(user_input, active_user)
+                    vektory, graf = ziskej_kontext(user_input, active_user)
+                    historie_pro_prompt = zpravy[:-1]
+                    odpoved = generuj_odpoved(
+                        user_input,
+                        vektory,
+                        graf,
+                        active_user,
+                        historie_pro_prompt,
+                        rezim,
+                    )
+                    try:
+                        uc_se_z_zpravy(user_input, active_user)
+                    except Exception as e:
+                        uceni_chyba = formatuj_chybu(e)
+                        odpoved = f"{odpoved}\n\n⚠️ Učení z paměti selhalo: {uceni_chyba}"
+                    st.write(odpoved)
                 except Exception as e:
-                    uceni_chyba = formatuj_chybu(e)
-                    odpoved = f"{odpoved}\n\n⚠️ Učení z paměti selhalo: {uceni_chyba}"
-                st.write(odpoved)
-            except Exception as e:
-                odpoved = formatuj_chybu(e)
-                st.error(odpoved)
+                    odpoved = formatuj_chybu(e)
+                    st.error(odpoved)
 
-    zpravy.append({"role": "assistant", "content": odpoved})
-    st.rerun()
+        zpravy.append({"role": "assistant", "content": odpoved})
+        st.rerun()
+
+with tab_pamet:
+    st.markdown(f"Vzpomínky uživatele **{active_user}**")
+    vzpominky = nacti_vzpominky_uzivatele(active_user)
+
+    if not vzpominky:
+        st.info("Pro tohoto uživatele zatím nejsou žádné vzpomínky.")
+    else:
+        for zaznam in vzpominky:
+            point_id = zaznam["id"]
+            razitko, text_vzpominky = rozdel_razitko_a_text(zaznam.get("text", ""))
+            col_text, col_btn = st.columns([5, 1])
+            with col_text:
+                st.markdown(f"**{razitko}**")
+                st.write(text_vzpominky)
+            with col_btn:
+                if st.button("Smazat", key=f"smazat_{point_id}"):
+                    try:
+                        smaz_vzpominku(point_id)
+                        st.rerun()
+                    except Exception as e:
+                        st.error(formatuj_chybu(e))
+            st.divider()
