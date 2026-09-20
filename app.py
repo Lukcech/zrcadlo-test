@@ -20,6 +20,8 @@ GEN_MODEL = "gemini-3.1-flash-lite"
 EMBED_MODEL = "gemini-embedding-001"
 QDRANT_COLLECTION = "zrcadlo_pamet"
 EMBED_DIM = 768
+REZIM_KREATIVNI = "Kreativní parťák"
+REZIM_TREZOR = "Striktní Trezor (NotebookLM)"
 
 
 def nacti_api_klic():
@@ -128,6 +130,40 @@ def formatuj_chybu(exc: Exception) -> str:
     return f"Chyba API: {cast}"
 
 
+def nacti_vzpominky_uzivatele(user_id: str) -> list:
+    """Načte všechny paměťové záznamy daného user_id z Qdrantu."""
+
+    def _scroll_all(client):
+        zaznamy = []
+        offset = None
+        while True:
+            points, next_offset = client.scroll(
+                collection_name=QDRANT_COLLECTION,
+                limit=100,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for p in points:
+                if p.payload.get("user_id", "karel") == user_id:
+                    zaznamy.append(
+                        {
+                            "id": str(p.id),
+                            "text": p.payload.get("text", ""),
+                            "user_id": p.payload.get("user_id", user_id),
+                        }
+                    )
+            if next_offset is None:
+                break
+            offset = next_offset
+        return zaznamy
+
+    try:
+        return qdrant_operace(_scroll_all)
+    except Exception:
+        return []
+
+
 st.set_page_config(page_title="Projekt Zrcadlo", page_icon="🪞", layout="wide")
 
 try:
@@ -163,19 +199,27 @@ conn.close()
 with st.sidebar:
     st.header("👤 Profil & Paměť")
     active_user = st.text_input("Aktivní Uživatel (user_id):", value="karel").strip().lower()
+
+    st.divider()
+    rezim = st.radio(
+        "Režim odpovědí",
+        [REZIM_KREATIVNI, REZIM_TREZOR],
+        index=0,
+        help="Kreativní parťák = empatická konverzace. Striktní Trezor = jen fakta z paměti.",
+    )
+    if rezim == REZIM_TREZOR:
+        st.caption("temperature=0.0 · odpovídá jen z nalezených faktů")
+    else:
+        st.caption("temperature=0.6 · empatická konverzace")
+
     st.divider()
     st.caption(f"Živý náhled paměti pro: **{active_user}**")
 
     try:
-        def _nacti_body(client):
-            return client.scroll(collection_name=QDRANT_COLLECTION, limit=200)[0]
-
-        all_points = qdrant_operace(_nacti_body)
-        user_points = [
-            p for p in all_points if p.payload.get("user_id", "karel") == active_user
-        ]
-        pocet_vektoru = len(user_points)
+        user_vzpominky = nacti_vzpominky_uzivatele(active_user)
+        pocet_vektoru = len(user_vzpominky)
     except Exception:
+        user_vzpominky = []
         pocet_vektoru = 0
 
     st.metric("Vektory uživatele", pocet_vektoru)
@@ -197,6 +241,22 @@ with st.sidebar:
                 st.write(f"**{t[0]}** `-{t[1]}->` **{t[2]}**")
         else:
             st.info("Tento uživatel nemá v grafu žádné vazby.")
+
+    st.divider()
+    st.subheader("📦 Export")
+    export_data = {
+        "user_id": active_user,
+        "exported_at": datetime.now().isoformat(timespec="seconds"),
+        "count": len(user_vzpominky),
+        "memories": user_vzpominky,
+    }
+    st.download_button(
+        label="Stáhnout mé vzpomínky (JSON)",
+        data=json.dumps(export_data, ensure_ascii=False, indent=2),
+        file_name=f"{active_user}_zrcadlo_memory.json",
+        mime="application/json",
+        use_container_width=True,
+    )
 
 
 # --- POMOCNÉ FUNKCE PRO AUTOMATICKOU PAMĚŤ ---
@@ -334,9 +394,25 @@ Zpráva:
         conn.close()
 
 
-def generuj_odpoved(dotaz, vektory, graf, user_id, historie_chatu):
-    prompt = f"""
-Jsi Zrcadlo, empatický AI průvodce uživatele '{user_id}'.
+def generuj_odpoved(dotaz, vektory, graf, user_id, historie_chatu, rezim):
+    if rezim == REZIM_TREZOR:
+        teplota = 0.0
+        pravidla = f"""
+Jsi Zrcadlo v režimu Striktní Trezor (NotebookLM) pro uživatele '{user_id}'.
+
+PRAVIDLA:
+- Odpovídej VÝHRADNĚ na základě nalezených paměťových faktů: vektorových vzpomínek a grafových vazeb.
+- Historii chatu používej jen k pochopení otázky, ne jako zdroj nových faktů.
+- Pokud informace v databázi (vzpomínkách / grafu) není, explicitně to přiznej, např.:
+  „Tuto informaci v databázi nemám.“
+- Nevymýšlej, nedoplňuj a neodvozuj nepodložené detaily.
+- Cituj nebo parafrázuj jen to, co je ve VEKTOROVÝCH VZPOMÍNKÁCH nebo GRAFOVÝCH VAZBÁCH.
+- Na začátku vzpomínek může být časové razítko [DD.MM.YYYY HH:MM] — ber ho v potaz.
+"""
+    else:
+        teplota = 0.6
+        pravidla = f"""
+Jsi Zrcadlo, empatický AI průvodce (Kreativní parťák) uživatele '{user_id}'.
 
 PRAVIDLA:
 - Vycházej primárně ze zadaných faktů: vektorových vzpomínek, grafových vazeb a historie chatu.
@@ -344,6 +420,10 @@ PRAVIDLA:
 - Pokud něco nevíš, otevřeně to řekni. Nehalucinuj.
 - Na začátku vzpomínek může být časové razítko [DD.MM.YYYY HH:MM] — ber ho v potaz.
 - Odpovídej přátelsky, přímo a s pochopením a plynule navazuj na krátkodobou historii chatu.
+"""
+
+    prompt = f"""
+{pravidla}
 
 DOTAZ UŽIVATELE ({user_id}):
 {dotaz}
@@ -361,7 +441,7 @@ GRAFOVÉ VAZBY:
         odpoved = genai_client.models.generate_content(
             model=GEN_MODEL,
             contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.2),
+            config=types.GenerateContentConfig(temperature=teplota),
         )
         return odpoved.text
     except Exception as e:
@@ -370,7 +450,7 @@ GRAFOVÉ VAZBY:
 
 # --- HLAVNÍ CHAT ROZHRANÍ ---
 st.title("🪞 Zrcadlo")
-st.subheader(f"Konverzace pro uživatele: :blue[{active_user}]")
+st.subheader(f"Konverzace pro uživatele: :blue[{active_user}] · režim: :blue[{rezim}]")
 
 if "chat_historie" not in st.session_state:
     st.session_state.chat_historie = {}
@@ -399,6 +479,7 @@ if user_input := st.chat_input("Napiš zprávu pro Zrcadlo..."):
                     graf,
                     active_user,
                     historie_pro_prompt,
+                    rezim,
                 )
                 try:
                     uc_se_z_zpravy(user_input, active_user)
