@@ -2,6 +2,7 @@
 import json
 import os
 import sqlite3
+import time
 import uuid
 from datetime import datetime
 
@@ -23,6 +24,15 @@ QDRANT_COLLECTION = "zrcadlo_pamet"
 EMBED_DIM = 768
 REZIM_KREATIVNI = "Kreativní parťák"
 REZIM_TREZOR = "Striktní Trezor (NotebookLM)"
+HLASKA_API_VYTIZENE = (
+    "Google API je momentálně vytížené, zkus to prosím za pár sekund znovu."
+)
+GEMINI_MAX_POKUSU = 3
+GEMINI_CEKANI_S = 2
+
+
+class GeminiVytizeneError(RuntimeError):
+    """Gemini API zůstalo vytížené i po opakovaných pokusech."""
 
 
 def nacti_api_klic():
@@ -120,6 +130,8 @@ def formatuj_historii_chatu(zpravy, limit=5) -> str:
 
 def formatuj_chybu(exc: Exception) -> str:
     """Sestaví čitelnou chybovou hlášku včetně kódu, pokud je dostupný."""
+    if isinstance(exc, GeminiVytizeneError):
+        return str(exc) or HLASKA_API_VYTIZENE
     kod = getattr(exc, "code", None) or getattr(exc, "status_code", None)
     if kod is None:
         details = getattr(exc, "details", None)
@@ -129,6 +141,57 @@ def formatuj_chybu(exc: Exception) -> str:
     if kod is not None:
         return f"Chyba API [{kod}]: {cast}"
     return f"Chyba API: {cast}"
+
+
+def je_prechodna_gemini_chyba(exc: Exception) -> bool:
+    """True u dočasných chyb 503 / ServerError / High Demand."""
+    if isinstance(exc, GeminiVytizeneError):
+        return True
+    kod = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    text = str(exc).lower()
+    nazev = type(exc).__name__.lower()
+    return (
+        kod == 503
+        or "503" in text
+        or "servererror" in nazev
+        or "server error" in text
+        or "high demand" in text
+        or "unavailable" in text
+        or "overloaded" in text
+        or "resource_exhausted" in text
+        or "vytížené" in text
+    )
+
+
+def zprava_pro_uzivatele(exc: Exception) -> str:
+    """Přátelská hláška pro UI; u 503 bez dumpování celé výjimky."""
+    if je_prechodna_gemini_chyba(exc):
+        return HLASKA_API_VYTIZENE
+    if isinstance(exc, RuntimeError) and str(exc):
+        return str(exc)
+    return formatuj_chybu(exc)
+
+
+def gemini_s_opakovanim(fn, pokusu: int = GEMINI_MAX_POKUSU):
+    """
+    Spustí Gemini volání s opakováním při 503 / ServerError / RuntimeError.
+    Po vyčerpání pokusů u vytížení vrátí přívětivou českou hlášku.
+    """
+    posledni = None
+    for pokus in range(1, pokusu + 1):
+        try:
+            return fn()
+        except Exception as e:
+            posledni = e
+            opakovat = je_prechodna_gemini_chyba(e) or isinstance(e, RuntimeError)
+            if opakovat and pokus < pokusu:
+                time.sleep(GEMINI_CEKANI_S)
+                continue
+            break
+
+    if je_prechodna_gemini_chyba(posledni):
+        raise GeminiVytizeneError(HLASKA_API_VYTIZENE) from posledni
+    raise RuntimeError(formatuj_chybu(posledni)) from posledni
 
 
 def nacti_vzpominky_uzivatele(user_id: str) -> list:
@@ -291,22 +354,19 @@ with st.sidebar:
 
 # --- POMOCNÉ FUNKCE PRO AUTOMATICKOU PAMĚŤ ---
 def ziskej_embedding(text):
-    try:
+    def _call():
         vysledek = genai_client.models.embed_content(
             model=EMBED_MODEL,
             contents=text,
             config=types.EmbedContentConfig(output_dimensionality=EMBED_DIM),
         )
         return vysledek.embeddings[0].values
-    except Exception as e:
-        raise RuntimeError(formatuj_chybu(e)) from e
+
+    return gemini_s_opakovanim(_call)
 
 
 def ziskej_kontext(dotaz, user_id):
-    try:
-        vektor = ziskej_embedding(dotaz)
-    except Exception as e:
-        raise RuntimeError(formatuj_chybu(e)) from e
+    vektor = ziskej_embedding(dotaz)
 
     try:
         def _hledej(client):
@@ -314,14 +374,18 @@ def ziskej_kontext(dotaz, user_id):
                 collection_name=QDRANT_COLLECTION,
                 query=vektor,
                 limit=10,
+                query_filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="user_id",
+                            match=models.MatchValue(value=user_id),
+                        )
+                    ]
+                ),
             ).points
 
         q_res = qdrant_operace(_hledej)
-        vektory_text = [
-            hit.payload.get("text", "")
-            for hit in q_res
-            if hit.payload.get("user_id", "karel") == user_id
-        ][:3]
+        vektory_text = [hit.payload.get("text", "") for hit in q_res if hit.payload]
     except Exception:
         vektory_text = []
 
@@ -335,6 +399,31 @@ def ziskej_kontext(dotaz, user_id):
     conn.close()
 
     return vektory_text, graf_res
+
+
+def posledni_vzpominky_texty(user_id: str, limit: int = 10) -> list:
+    """Vrátí texty posledních N vzpomínek uživatele (podle časového razítka)."""
+    vse = nacti_vzpominky_uzivatele(user_id)
+
+    def _sort_key(zaznam):
+        razitko, _ = rozdel_razitko_a_text(zaznam.get("text", ""))
+        try:
+            return datetime.strptime(razitko, "%d.%m.%Y %H:%M")
+        except Exception:
+            return datetime.min
+
+    serazene = sorted(vse, key=_sort_key)
+    return [z.get("text", "") for z in serazene[-limit:] if z.get("text")]
+
+
+def uvitaci_zprava(user_id: str) -> str:
+    """Úvodní zpráva Zrcadla po obnovení relace."""
+    jmeno = (user_id or "").strip().capitalize() or "příteli"
+    osloveni = "Karle" if jmeno.lower() == "karel" else jmeno
+    return (
+        f"Ahoj {osloveni}, vítám tě zpět! Procházím tvé uložené vzpomínky "
+        "a navazuji tam, kde jsme skončili. Na co se chceš dnes zaměřit?"
+    )
 
 
 def uc_se_z_zpravy(zprava, user_id):
@@ -371,16 +460,23 @@ Zpráva:
     }
 
     try:
-        odpoved = genai_client.models.generate_content(
-            model=GEN_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=schema,
-            ),
-        )
+        def _call():
+            return genai_client.models.generate_content(
+                model=GEN_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=schema,
+                ),
+            )
+
+        odpoved = gemini_s_opakovanim(_call)
         data = json.loads(odpoved.text)
+    except GeminiVytizeneError:
+        raise
     except Exception as e:
+        if je_prechodna_gemini_chyba(e):
+            raise GeminiVytizeneError(HLASKA_API_VYTIZENE) from e
         raise RuntimeError(formatuj_chybu(e)) from e
 
     fakta = data.get("facts", [])
@@ -424,7 +520,7 @@ Zpráva:
         conn.close()
 
 
-def generuj_odpoved(dotaz, vektory, graf, user_id, historie_chatu, rezim):
+def generuj_odpoved(dotaz, vektory, graf, user_id, historie_chatu, rezim, uvitaci_kontext=None):
     if rezim == REZIM_TREZOR:
         teplota = 0.0
         pravidla = f"""
@@ -438,6 +534,7 @@ PRAVIDLA:
 - Nevymýšlej, nedoplňuj a neodvozuj nepodložené detaily.
 - Cituj nebo parafrázuj jen to, co je ve VEKTOROVÝCH VZPOMÍNKÁCH nebo GRAFOVÝCH VAZBÁCH.
 - Na začátku vzpomínek může být časové razítko [DD.MM.YYYY HH:MM] — ber ho v potaz.
+- UVÍTACÍ PAMĚŤOVÝ PŘEHLED používej jako obnovený kontext po restartu relace.
 """
     else:
         teplota = 0.6
@@ -450,7 +547,17 @@ PRAVIDLA:
 - Pokud něco nevíš, otevřeně to řekni. Nehalucinuj.
 - Na začátku vzpomínek může být časové razítko [DD.MM.YYYY HH:MM] — ber ho v potaz.
 - Odpovídej přátelsky, přímo a s pochopením a plynule navazuj na krátkodobou historii chatu.
+- UVÍTACÍ PAMĚŤOVÝ PŘEHLED obsahuje poslední vzpomínky načtené po restartu — navazuj na ně.
 """
+
+    uvitaci = uvitaci_kontext or []
+    # Spoj vyhledané vzpomínky s uvítacím přehledem (bez duplicit), max 10+10
+    spojene = []
+    videne = set()
+    for text in list(uvitaci) + list(vektory):
+        if text and text not in videne:
+            spojene.append(text)
+            videne.add(text)
 
     prompt = f"""
 {pravidla}
@@ -461,21 +568,24 @@ DOTAZ UŽIVATELE ({user_id}):
 KRÁTKODOBÁ PAMĚŤ (poslední zprávy tohoto chatu):
 {formatuj_historii_chatu(historie_chatu, limit=5)}
 
-VEKTOROVÉ VZPOMÍNKY:
-{chr(10).join(vektory) if vektory else "Žádné předchozí vzpomínky."}
+UVÍTACÍ PAMĚŤOVÝ PŘEHLED (poslední vzpomínky po restartu):
+{chr(10).join(uvitaci) if uvitaci else "Žádný uvítací přehled."}
+
+VEKTOROVÉ VZPOMÍNKY (relevantní k dotazu, až 10):
+{chr(10).join(spojene) if spojene else "Žádné předchozí vzpomínky."}
 
 GRAFOVÉ VAZBY:
 {chr(10).join(graf) if graf else "Žádné předchozí grafové vazby."}
 """
-    try:
-        odpoved = genai_client.models.generate_content(
+    def _call():
+        return genai_client.models.generate_content(
             model=GEN_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(temperature=teplota),
         )
-        return odpoved.text
-    except Exception as e:
-        raise RuntimeError(formatuj_chybu(e)) from e
+
+    odpoved = gemini_s_opakovanim(_call)
+    return odpoved.text
 
 
 # --- HLAVNÍ ROZHRANÍ ---
@@ -487,10 +597,21 @@ tab_chat, tab_pamet = st.tabs(["💬 Chat", "🧠 Správa paměti"])
 with tab_chat:
     if "chat_historie" not in st.session_state:
         st.session_state.chat_historie = {}
+    if "uvitaci_kontext" not in st.session_state:
+        st.session_state.uvitaci_kontext = {}
     if active_user not in st.session_state.chat_historie:
         st.session_state.chat_historie[active_user] = []
 
     zpravy = st.session_state.chat_historie[active_user]
+
+    # Po restartu / prázdné historii: načti posledních 10 vzpomínek + úvodní zpráva
+    if not zpravy:
+        st.session_state.uvitaci_kontext[active_user] = posledni_vzpominky_texty(
+            active_user, limit=10
+        )
+        zpravy.append(
+            {"role": "assistant", "content": uvitaci_zprava(active_user)}
+        )
 
     for msg in zpravy:
         with st.chat_message(msg["role"]):
@@ -513,15 +634,18 @@ with tab_chat:
                         active_user,
                         historie_pro_prompt,
                         rezim,
+                        uvitaci_kontext=st.session_state.uvitaci_kontext.get(
+                            active_user, []
+                        ),
                     )
                     try:
                         uc_se_z_zpravy(user_input, active_user)
                     except Exception as e:
-                        uceni_chyba = formatuj_chybu(e)
+                        uceni_chyba = zprava_pro_uzivatele(e)
                         odpoved = f"{odpoved}\n\n⚠️ Učení z paměti selhalo: {uceni_chyba}"
                     st.write(odpoved)
                 except Exception as e:
-                    odpoved = formatuj_chybu(e)
+                    odpoved = zprava_pro_uzivatele(e)
                     st.error(odpoved)
 
         zpravy.append({"role": "assistant", "content": odpoved})
