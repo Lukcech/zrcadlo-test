@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -18,9 +19,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Cesty k souborům
+BASE_DIR = Path(__file__).resolve().parent.parent
+DIST_DIR = BASE_DIR / "frontend" / "dist"
+
 @app.on_event("startup")
 def startup_event():
     init_db()
+    print(f"[ZRCADLO] BASE_DIR: {BASE_DIR}")
+    print(f"[ZRCADLO] DIST_DIR: {DIST_DIR} | Existuje: {DIST_DIR.exists()}")
 
 class ChatRequest(BaseModel):
     user_id: str
@@ -52,23 +59,30 @@ def get_memories_endpoint(user_id: str):
             limit=100
         )[0]
         return [{"id": hit.id, "text": hit.payload["text"]} for hit in results]
-    except Exception as e:
+    except Exception:
         return []
 
-# --- PROPOJENÍ S REACT FRONTENDEM ---
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DIST_DIR = os.path.join(BASE_DIR, "frontend", "dist")
+# Servírování statických souborů (assets)
+assets_dir = DIST_DIR / "assets"
+if assets_dir.exists():
+    app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
 
-if os.path.exists(DIST_DIR):
-    assets_dir = os.path.join(DIST_DIR, "assets")
-    if os.path.exists(assets_dir):
-        app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
-
-    @app.get("/{full_path:path}")
-    async def serve_react(full_path: str):
-        if full_path.startswith("api/"):
-            return {"detail": "Not Found"}
-        file_path = os.path.join(DIST_DIR, full_path)
-        if os.path.exists(file_path) and os.path.isfile(file_path):
-            return FileResponse(file_path)
-        return FileResponse(os.path.join(DIST_DIR, "index.html"))
+# Hlavní odchytávání cest pro React frontend
+@app.get("/{full_path:path}")
+async def serve_react(full_path: str):
+    if full_path.startswith("api/"):
+        return {"detail": "Not Found"}
+    
+    file_path = DIST_DIR / full_path
+    if file_path.exists() and file_path.is_file():
+        return FileResponse(str(file_path))
+    
+    index_path = DIST_DIR / "index.html"
+    if index_path.exists():
+        return FileResponse(str(index_path))
+    
+    return {
+        "status": "Chyba načtení frontendu",
+        "detail": f"Soubor index.html nebyl nalezen na adrese: {index_path}",
+        "dist_exists": DIST_DIR.exists()
+    }
