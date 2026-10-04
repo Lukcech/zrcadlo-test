@@ -1,674 +1,162 @@
-# -*- coding: utf-8 -*-
-import json
 import os
-import sqlite3
-import time
-import uuid
-from datetime import datetime
-
 import streamlit as st
-from dotenv import load_dotenv
-from google import genai
-from google.genai import types
+import google.generativeai as genai
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
-from qdrant_client.models import Distance, PointStruct, VectorParams
 
-load_dotenv()
+# Konfigurace aplikace
+st.set_page_config(page_title="Zrcadlo", page_icon="🪞", layout="wide")
 
-DB_PATH = "./qdrant_db"
-GRAPH_DB_PATH = "znalostni_graf.db"
-GEN_MODEL = "gemini-3.6-flash"
+# Načtení API klíče
+API_KEY = st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
+if API_KEY:
+    genai.configure(api_key=API_KEY)
+
 EMBED_MODEL = "gemini-embedding-001"
-QDRANT_COLLECTION = "zrcadlo_pamet"
 EMBED_DIM = 3072
-REZIM_KREATIVNI = "Kreativní parťák"
-REZIM_TREZOR = "Striktní Trezor (NotebookLM)"
-HLASKA_API_VYTIZENE = (
-    "Google API je momentálně vytížené, zkus to prosím za pár sekund znovu."
-)
-# 1. pokus + 1 retry při 429/503
-GEMINI_MAX_POKUSU = 3
-GEMINI_CEKANI_S = 2
+COLLECTION_NAME = "zrcadlo_pamet"
+PRIMARY_MODEL = "gemini-3.5-flash-lite"
+FALLBACK_MODEL = "gemini-3.5-flash"
 
-
-class GeminiVytizeneError(RuntimeError):
-    """Gemini API zůstalo vytížené i po opakovaných pokusech."""
-
-
-def nacti_api_klic():
-    """Načte API klíč ze st.secrets (Cloud) nebo z .env / prostředí (lokálně)."""
-    try:
-        if "API_KEY" in st.secrets:
-            return st.secrets["API_KEY"]
-    except Exception:
-        pass
-
-    klic = os.getenv("API_KEY")
-    if klic:
-        return klic
-
-    raise ValueError(
-        "API_KEY nebyl nalezen. Nastav ho v .streamlit/secrets.toml "
-        "nebo v souboru .env (API_KEY=...)."
-    )
-
-
-def vytvor_qdrant_client() -> QdrantClient:
-    """Připojení k Qdrant Cloudu ze secrets, jinak lokální ./qdrant_db."""
-    try:
-        if "QDRANT_URL" in st.secrets and "QDRANT_API_KEY" in st.secrets:
-            return QdrantClient(
-                url=st.secrets["QDRANT_URL"],
-                api_key=st.secrets["QDRANT_API_KEY"],
-            )
-    except Exception:
-        pass
-
-    return QdrantClient(path=DB_PATH)
-
-
-def zajisti_kolekci(client: QdrantClient) -> None:
-    """Vytvoří kolekci zrcadlo_pamet, pokud ještě neexistuje."""
-    existuje = False
-    try:
-        if hasattr(client, "collection_exists"):
-            existuje = client.collection_exists(collection_name=QDRANT_COLLECTION)
-        else:
-            jmena = [c.name for c in client.get_collections().collections]
-            existuje = QDRANT_COLLECTION in jmena
-    except Exception:
-        existuje = False
-
-    if not existuje:
+# Inicializace databáze
+@st.cache_resource
+def get_qdrant_client():
+    client = QdrantClient(path="./qdrant_db")
+    collections = [c.name for c in client.get_collections().collections]
+    if COLLECTION_NAME not in collections:
         client.create_collection(
-            collection_name=QDRANT_COLLECTION,
-            vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
+            collection_name=COLLECTION_NAME,
+            vectors_config=models.VectorParams(size=EMBED_DIM, distance=models.Distance.COSINE)
         )
+    return client
 
+qdrant = get_qdrant_client()
 
-def je_chyba_404(exc: Exception) -> bool:
-    """True, pokud výjimka vypadá jako chybějící kolekce (404 / Not Found)."""
-    kod = getattr(exc, "status_code", None) or getattr(exc, "code", None)
-    text = str(exc).lower()
-    return kod == 404 or "404" in text or "not found" in text or "doesn't exist" in text
-
-
-def qdrant_operace(fn):
-    """
-    Spustí operaci nad Qdrantem: předem zajistí kolekci,
-    při 404 ji znovu vytvoří a operaci jednou zopakuje.
-    """
-    client = vytvor_qdrant_client()
+def get_embedding(text: str):
     try:
-        zajisti_kolekci(client)
-        try:
-            return fn(client)
-        except Exception as e:
-            if je_chyba_404(e):
-                zajisti_kolekci(client)
-                return fn(client)
-            raise
-    finally:
-        client.close()
+        res = genai.embed_content(
+            model=EMBED_MODEL,
+            content=text,
+            task_type="retrieval_document"
+        )
+        return res["embedding"]
+    except Exception:
+        return None
 
-
-def aktualni_razitko() -> str:
-    """Aktuální datum a čas ve formátu DD.MM.YYYY HH:MM."""
-    return datetime.now().strftime("%d.%m.%Y %H:%M")
-
-
-def formatuj_historii_chatu(zpravy, limit=5) -> str:
-    """Sestaví text posledních zpráv z aktuálního chatu."""
-    if not zpravy:
-        return "Žádná předchozí konverzace v této relaci."
-    casti = []
-    for msg in zpravy[-limit:]:
-        role = "Uživatel" if msg.get("role") == "user" else "Zrcadlo"
-        casti.append(f"{role}: {msg.get('content', '')}")
-    return "\n".join(casti)
-
-
-def formatuj_chybu(exc: Exception) -> str:
-    """Sestaví čitelnou chybovou hlášku včetně kódu, pokud je dostupný."""
-    if isinstance(exc, GeminiVytizeneError):
-        return str(exc) or HLASKA_API_VYTIZENE
-    kod = getattr(exc, "code", None) or getattr(exc, "status_code", None)
-    if kod is None:
-        details = getattr(exc, "details", None)
-        if isinstance(details, dict):
-            kod = details.get("code") or details.get("status")
-    cast = f"{type(exc).__name__}: {exc}"
-    if kod is not None:
-        return f"Chyba API [{kod}]: {cast}"
-    return f"Chyba API: {cast}"
-
-
-def je_prechodna_gemini_chyba(exc: Exception) -> bool:
-    """True u dočasných chyb 429/503."""
-    if isinstance(exc, GeminiVytizeneError):
-        return True
-    kod = getattr(exc, "code", None) or getattr(exc, "status_code", None)
-    text = str(exc).lower()
-    nazev = type(exc).__name__.lower()
-    return (
-        kod in (429, 503)
-        or "429" in text
-        or "503" in text
-        or "resource_exhausted" in text
-        or "rate limit" in text
-        or "quota" in text
-        or "servererror" in nazev
-        or "server error" in text
-        or "high demand" in text
-        or "unavailable" in text
-        or "overloaded" in text
-        or "vytížené" in text
-    )
-
-
-def zprava_pro_uzivatele(exc: Exception) -> str:
-    """Přátelská hláška pro UI; u 503 bez dumpování celé výjimky."""
-    if je_prechodna_gemini_chyba(exc):
-        return HLASKA_API_VYTIZENE
-    if isinstance(exc, RuntimeError) and str(exc):
-        return str(exc)
-    return formatuj_chybu(exc)
-
-
-def gemini_s_opakovanim(fn, pokusu: int = GEMINI_MAX_POKUSU):
-    """Při 429/503 zopakuje volání jednou po 1 sekundě."""
-    posledni = None
-    for pokus in range(1, pokusu + 1):
-        try:
-            return fn()
-        except Exception as e:
-            posledni = e
-            if je_prechodna_gemini_chyba(e) and pokus < pokusu:
-                time.sleep(GEMINI_CEKANI_S)
-                continue
-            break
-
-    if je_prechodna_gemini_chyba(posledni):
-        raise GeminiVytizeneError(HLASKA_API_VYTIZENE) from posledni
-    raise RuntimeError(formatuj_chybu(posledni)) from posledni
-
-
-def nacti_vzpominky_uzivatele(user_id: str) -> list:
-    """Načte všechny paměťové záznamy daného user_id z Qdrantu."""
-
-    def _scroll_all(client):
-        zaznamy = []
-        offset = None
-        while True:
-            points, next_offset = client.scroll(
-                collection_name=QDRANT_COLLECTION,
-                limit=100,
-                offset=offset,
-                with_payload=True,
-                with_vectors=False,
+def store_memory(user_id: str, text: str):
+    vector = get_embedding(text)
+    if not vector:
+        return False
+    point_id = abs(hash(f"{user_id}_{text}")) % (10 ** 12)
+    qdrant.upsert(
+        collection_name=COLLECTION_NAME,
+        points=[
+            models.PointStruct(
+                id=point_id,
+                vector=vector,
+                payload={"user_id": user_id, "text": text}
             )
-            for p in points:
-                if p.payload.get("user_id", "") == user_id:
-                    zaznamy.append(
-                        {
-                            "id": p.id,
-                            "text": p.payload.get("text", ""),
-                            "user_id": p.payload.get("user_id", user_id),
-                        }
-                    )
-            if next_offset is None:
-                break
-            offset = next_offset
-        return zaznamy
+        ]
+    )
+    return True
 
+def search_memories(user_id: str, query: str, limit: int = 3):
+    vector = get_embedding(query)
+    if not vector:
+        return []
     try:
-        return qdrant_operace(_scroll_all)
+        results = qdrant.search(
+            collection_name=COLLECTION_NAME,
+            query_vector=vector,
+            query_filter=models.Filter(
+                must=[models.FieldCondition(key="user_id", match=models.MatchValue(value=user_id))]
+            ),
+            limit=limit
+        )
+        return [hit.payload["text"] for hit in results]
     except Exception:
         return []
 
-
-def smaz_vzpominku(point_id) -> None:
-    """Smaže jeden vektor z Qdrantu podle point.id."""
-
-    def _delete(client):
-        client.delete(
-            collection_name=QDRANT_COLLECTION,
-            points_selector=models.PointIdsList(points=[point_id]),
-        )
-
-    qdrant_operace(_delete)
-
-
-def rozdel_razitko_a_text(text: str):
-    """Oddělí [DD.MM.YYYY HH:MM] od zbytku vzpomínky, pokud je přítomné."""
-    if text.startswith("[") and "]" in text:
-        konec = text.find("]")
-        razitko = text[1:konec]
-        zbytek = text[konec + 1 :].lstrip()
-        return razitko, zbytek
-    return "—", text
-
-
-st.set_page_config(page_title="Projekt Zrcadlo", page_icon="🪞", layout="wide")
-
-try:
-    API_KEY = nacti_api_klic()
-    genai_client = genai.Client(api_key=API_KEY)
-except Exception as e:
-    st.error(formatuj_chybu(e))
-    st.stop()
-
-# --- DB INICIALIZACE A MIGRACE ---
-conn = sqlite3.connect(GRAPH_DB_PATH)
-cursor = conn.cursor()
-cursor.execute("PRAGMA table_info(triples)")
-columns = [col[1] for col in cursor.fetchall()]
-
-if not columns:
-    cursor.execute(
-        """
-            CREATE TABLE triples (
-            user_id TEXT DEFAULT '',
-            subject TEXT, relation TEXT, object TEXT,
-            UNIQUE(user_id, subject, relation, object)
-        )
-        """
-    )
-elif "user_id" not in columns:
-    cursor.execute("ALTER TABLE triples ADD COLUMN user_id TEXT DEFAULT ''")
-
-conn.commit()
-conn.close()
-
-# --- BOČNÍ PANEL ---
-with st.sidebar:
-    st.header("👤 Profil & Paměť")
-    active_user = st.text_input("Aktivní Uživatel (user_id):", value="lukas").strip().lower()
-
-    st.divider()
-    rezim = st.radio(
-        "Režim odpovědí",
-        [REZIM_KREATIVNI, REZIM_TREZOR],
-        index=0,
-        help="Kreativní parťák = empatická konverzace. Striktní Trezor = jen fakta z paměti.",
-    )
-    if rezim == REZIM_TREZOR:
-        st.caption("temperature=0.0 · odpovídá jen z nalezených faktů")
-    else:
-        st.caption("temperature=0.6 · empatická konverzace")
-
-    st.divider()
-    st.caption(f"Živý náhled paměti pro: **{active_user}**")
-
+def get_all_memories(user_id: str):
     try:
-        user_vzpominky = nacti_vzpominky_uzivatele(active_user)
-        pocet_vektoru = len(user_vzpominky)
+        results = qdrant.scroll(
+            collection_name=COLLECTION_NAME,
+            scroll_filter=models.Filter(
+                must=[models.FieldCondition(key="user_id", match=models.MatchValue(value=user_id))]
+            ),
+            limit=100
+        )[0]
+        return [hit.payload["text"] for hit in results]
     except Exception:
-        user_vzpominky = []
-        pocet_vektoru = 0
+        return []
 
-    st.metric("Vektory uživatele", pocet_vektoru)
+# UI Rozhraní
+st.title("🪞 Zrcadlo — AI Paměť")
 
-    conn = sqlite3.connect(GRAPH_DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT subject, relation, object FROM triples WHERE user_id = ?",
-        (active_user,),
-    )
-    uzivatelske_trojice = cursor.fetchall()
-    conn.close()
+st.sidebar.header("Nastavení")
+user_id = st.sidebar.text_input("USER ID", value="karel")
+persona = st.sidebar.radio("Režim odpovídání", ["Kreativní parťák", "Striktní Trezor"])
 
-    st.metric("Grafové vazby", len(uzivatelske_trojice))
+tab1, tab2 = st.tabs(["💬 Chat", "🧠 Správa paměti"])
 
-    with st.expander("🕸️ Znalostní graf uživatele"):
-        if uzivatelske_trojice:
-            for t in uzivatelske_trojice:
-                st.write(f"**{t[0]}** `-{t[1]}->` **{t[2]}**")
-        else:
-            st.info("Tento uživatel nemá v grafu žádné vazby.")
+with tab1:
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
 
-    st.divider()
-    st.subheader("📦 Export")
-    export_data = {
-        "user_id": active_user,
-        "exported_at": datetime.now().isoformat(timespec="seconds"),
-        "count": len(user_vzpominky),
-        "memories": [
-            {
-                "id": str(z["id"]),
-                "text": z.get("text", ""),
-                "user_id": z.get("user_id", active_user),
-            }
-            for z in user_vzpominky
-        ],
-    }
-    st.download_button(
-        label="Stáhnout mé vzpomínky (JSON)",
-        data=json.dumps(export_data, ensure_ascii=False, indent=2),
-        file_name=f"{active_user}_zrcadlo_memory.json",
-        mime="application/json",
-        use_container_width=True,
-    )
-
-
-# --- POMOCNÉ FUNKCE PRO AUTOMATICKOU PAMĚŤ ---
-def ziskej_embedding(text):
-    def _call():
-        vysledek = genai_client.models.embed_content(
-            model=EMBED_MODEL,
-            contents=text,
-            config=types.EmbedContentConfig(output_dimensionality=EMBED_DIM),
-        )
-        return vysledek.embeddings[0].values
-
-    return gemini_s_opakovanim(_call)
-
-
-def ziskej_kontext(dotaz, user_id):
-    vektor = ziskej_embedding(dotaz)
-
-    try:
-        def _hledej(client):
-            return client.query_points(
-                collection_name=QDRANT_COLLECTION,
-                query=vektor,
-                limit=10,
-                query_filter=models.Filter(
-                    must=[
-                        models.FieldCondition(
-                            key="user_id",
-                            match=models.MatchValue(value=user_id),
-                        )
-                    ]
-                ),
-            ).points
-
-        q_res = qdrant_operace(_hledej)
-        vektory_text = [hit.payload.get("text", "") for hit in q_res if hit.payload]
-    except Exception:
-        vektory_text = []
-
-    conn = sqlite3.connect(GRAPH_DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT subject, relation, object FROM triples WHERE user_id = ?",
-        (user_id,),
-    )
-    graf_res = [f"[{r[0]}] -> ({r[1]}) -> [{r[2]}]" for r in cursor.fetchall()]
-    conn.close()
-
-    return vektory_text, graf_res
-
-
-def posledni_vzpominky_texty(user_id: str, limit: int = 10) -> list:
-    """Vrátí texty posledních N vzpomínek uživatele (podle časového razítka)."""
-    vse = nacti_vzpominky_uzivatele(user_id)
-
-    def _sort_key(zaznam):
-        razitko, _ = rozdel_razitko_a_text(zaznam.get("text", ""))
-        try:
-            return datetime.strptime(razitko, "%d.%m.%Y %H:%M")
-        except Exception:
-            return datetime.min
-
-    serazene = sorted(vse, key=_sort_key)
-    return [z.get("text", "") for z in serazene[-limit:] if z.get("text")]
-
-
-def uvitaci_zprava(user_id: str) -> str:
-    """Úvodní zpráva Zrcadla po obnovení relace."""
-    jmeno = (user_id or "").strip().capitalize() or "příteli"
-    return (
-        f"Ahoj {jmeno}, vítám tě zpět! Procházím tvé uložené vzpomínky "
-        "a navazuji tam, kde jsme skončili. Na co se chceš dnes zaměřit?"
-    )
-
-
-def uc_se_z_zpravy(zprava, user_id):
-    """Extrahujeme fakta a graf na pozadí chatu a ukládáme nové vzpomínky."""
-    prompt = f"""
-Pokud zpráva obsahuje trvalé osobní fakta, preference, vztahy nebo tělesné/psychické prožitky, vyextrahuj je.
-Pokud zpráva neobsahuje žádná nová fakta (jen pozdrav, dotaz apod.), vrať prázdná pole.
-
-Vrať JSON:
-- facts: pole věcných tvrzení o uživateli (3. osoba)
-- triples: pole objektů {{"subject": "...", "relation": "...", "object": "..."}} (max 3 slova na entitu)
-
-Zpráva:
-{zprava}
-"""
-    schema = {
-        "type": "OBJECT",
-        "properties": {
-            "facts": {"type": "ARRAY", "items": {"type": "STRING"}},
-            "triples": {
-                "type": "ARRAY",
-                "items": {
-                    "type": "OBJECT",
-                    "properties": {
-                        "subject": {"type": "STRING"},
-                        "relation": {"type": "STRING"},
-                        "object": {"type": "STRING"},
-                    },
-                    "required": ["subject", "relation", "object"],
-                },
-            },
-        },
-        "required": ["facts", "triples"],
-    }
-
-    try:
-        def _call():
-            return genai_client.models.generate_content(
-                model=GEN_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=schema,
-                ),
-            )
-
-        odpoved = gemini_s_opakovanim(_call)
-        data = json.loads(odpoved.text)
-    except GeminiVytizeneError:
-        raise
-    except Exception as e:
-        if je_prechodna_gemini_chyba(e):
-            raise GeminiVytizeneError(HLASKA_API_VYTIZENE) from e
-        raise RuntimeError(formatuj_chybu(e)) from e
-
-    fakta = data.get("facts", [])
-    trojice = data.get("triples", [])
-
-    if fakta:
-        razitko = aktualni_razitko()
-        body = []
-        for f in fakta:
-            text_s_casem = f"[{razitko}] {f}"
-            v = ziskej_embedding(text_s_casem)
-            body.append(
-                PointStruct(
-                    id=str(uuid.uuid4()),
-                    vector=v,
-                    payload={"text": text_s_casem, "user_id": user_id},
-                )
-            )
-
-        def _uloz(client):
-            client.upsert(collection_name=QDRANT_COLLECTION, points=body)
-
-        qdrant_operace(_uloz)
-
-    if trojice:
-        conn = sqlite3.connect(GRAPH_DB_PATH)
-        cursor = conn.cursor()
-        for t in trojice:
-            sub = t.get("subject", "").lower().strip()
-            rel = t.get("relation", "").lower().strip()
-            obj = t.get("object", "").lower().strip()
-            if sub and rel and obj:
-                try:
-                    cursor.execute(
-                        "INSERT INTO triples (user_id, subject, relation, object) VALUES (?, ?, ?, ?)",
-                        (user_id, sub, rel, obj),
-                    )
-                except sqlite3.IntegrityError:
-                    pass
-        conn.commit()
-        conn.close()
-
-
-def generuj_odpoved(dotaz, vektory, graf, user_id, historie_chatu, rezim, uvitaci_kontext=None):
-    if rezim == REZIM_TREZOR:
-        teplota = 0.0
-        pravidla = f"""
-Jsi Zrcadlo v režimu Striktní Trezor (NotebookLM) pro uživatele '{user_id}'.
-
-PRAVIDLA:
-- Odpovídej VÝHRADNĚ na základě nalezených paměťových faktů: vektorových vzpomínek a grafových vazeb.
-- Historii chatu používej jen k pochopení otázky, ne jako zdroj nových faktů.
-- Pokud informace v databázi (vzpomínkách / grafu) není, explicitně to přiznej, např.:
-  „Tuto informaci v databázi nemám.“
-- Nevymýšlej, nedoplňuj a neodvozuj nepodložené detaily.
-- Cituj nebo parafrázuj jen to, co je ve VEKTOROVÝCH VZPOMÍNKÁCH nebo GRAFOVÝCH VAZBÁCH.
-- Na začátku vzpomínek může být časové razítko [DD.MM.YYYY HH:MM] — ber ho v potaz.
-- UVÍTACÍ PAMĚŤOVÝ PŘEHLED používej jako obnovený kontext po restartu relace.
-"""
-    else:
-        teplota = 0.6
-        pravidla = f"""
-Jsi Zrcadlo, empatický AI průvodce (Kreativní parťák) uživatele '{user_id}'.
-
-PRAVIDLA:
-- Vycházej primárně ze zadaných faktů: vektorových vzpomínek, grafových vazeb a historie chatu.
-- Nevymýšlej si nepodložené detaily, události, jména ani pocity, které v podkladech nejsou.
-- Pokud něco nevíš, otevřeně to řekni. Nehalucinuj.
-- Na začátku vzpomínek může být časové razítko [DD.MM.YYYY HH:MM] — ber ho v potaz.
-- Odpovídej přátelsky, přímo a s pochopením a plynule navazuj na krátkodobou historii chatu.
-- UVÍTACÍ PAMĚŤOVÝ PŘEHLED obsahuje poslední vzpomínky načtené po restartu — navazuj na ně.
-"""
-
-    uvitaci = uvitaci_kontext or []
-    # Spoj vyhledané vzpomínky s uvítacím přehledem (bez duplicit), max 10+10
-    spojene = []
-    videne = set()
-    for text in list(uvitaci) + list(vektory):
-        if text and text not in videne:
-            spojene.append(text)
-            videne.add(text)
-
-    prompt = f"""
-{pravidla}
-
-DOTAZ UŽIVATELE ({user_id}):
-{dotaz}
-
-KRÁTKODOBÁ PAMĚŤ (poslední zprávy tohoto chatu):
-{formatuj_historii_chatu(historie_chatu, limit=5)}
-
-UVÍTACÍ PAMĚŤOVÝ PŘEHLED (poslední vzpomínky po restartu):
-{chr(10).join(uvitaci) if uvitaci else "Žádný uvítací přehled."}
-
-VEKTOROVÉ VZPOMÍNKY (relevantní k dotazu, až 10):
-{chr(10).join(spojene) if spojene else "Žádné předchozí vzpomínky."}
-
-GRAFOVÉ VAZBY:
-{chr(10).join(graf) if graf else "Žádné předchozí grafové vazby."}
-"""
-    def _call():
-        return genai_client.models.generate_content(
-            model=GEN_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=teplota),
-        )
-
-    odpoved = gemini_s_opakovanim(_call)
-    return odpoved.text
-
-
-# --- HLAVNÍ ROZHRANÍ ---
-st.title("🪞 Zrcadlo")
-st.subheader(f"Uživatel: :blue[{active_user}] · režim: :blue[{rezim}]")
-
-tab_chat, tab_pamet = st.tabs(["💬 Chat", "🧠 Správa paměti"])
-
-with tab_chat:
-    if "chat_historie" not in st.session_state:
-        st.session_state.chat_historie = {}
-    if "uvitaci_kontext" not in st.session_state:
-        st.session_state.uvitaci_kontext = {}
-    if active_user not in st.session_state.chat_historie:
-        st.session_state.chat_historie[active_user] = []
-
-    zpravy = st.session_state.chat_historie[active_user]
-
-    # Po restartu / prázdné historii: načti posledních 10 vzpomínek + úvodní zpráva
-    if not zpravy:
-        st.session_state.uvitaci_kontext[active_user] = posledni_vzpominky_texty(
-            active_user, limit=10
-        )
-        zpravy.append(
-            {"role": "assistant", "content": uvitaci_zprava(active_user)}
-        )
-
-    for msg in zpravy:
+    for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.write(msg["content"])
 
-    if user_input := st.chat_input("Napiš zprávu pro Zrcadlo..."):
-        zpravy.append({"role": "user", "content": user_input})
+    if prompt := st.chat_input("Napiš Zrcadlu..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
-            st.write(user_input)
+            st.write(prompt)
 
         with st.chat_message("assistant"):
-            with st.spinner("Zrcadlo přemýšlí a ukládá poznatky..."):
+            with st.spinner("Zrcadlo přemýšlí..."):
+                memories = search_memories(user_id, prompt)
+                context_str = "\n".join([f"- {m}" for m in memories]) if memories else "Žádné předchozí vzpomínky."
+
+                system_instruction = f"""Jsi Zrcadlo, empatický AI průvodce uživatele '{user_id}'.
+Styl komunikace: {persona}.
+Zde jsou známá fakta o uživateli z trvalé paměti:
+{context_str}
+
+Odpovídej přirozeně, lidsky a využívej znalosti z paměti, pokud se hodí."""
+
+                reply_text = None
+                for m_name in [PRIMARY_MODEL, FALLBACK_MODEL]:
+                    try:
+                        model = genai.GenerativeModel(model_name=m_name, system_instruction=system_instruction)
+                        res = model.generate_content(prompt)
+                        reply_text = res.text
+                        break
+                    except Exception:
+                        continue
+
+                if not reply_text:
+                    reply_text = "Omlouvám se, služba Gemini je momentálně přetížená. Zkus to prosím za okamžik."
+
+                st.write(reply_text)
+                st.session_state.messages.append({"role": "assistant", "content": reply_text})
+
                 try:
-                    vektory, graf = ziskej_kontext(user_input, active_user)
-                    historie_pro_prompt = zpravy[:-1]
-                    odpoved = generuj_odpoved(
-                        user_input,
-                        vektory,
-                        graf,
-                        active_user,
-                        historie_pro_prompt,
-                        rezim,
-                        uvitaci_kontext=st.session_state.uvitaci_kontext.get(
-                            active_user, []
-                        ),
-                    )
-                    try:
-                        uc_se_z_zpravy(user_input, active_user)
-                    except Exception as e:
-                        uceni_chyba = zprava_pro_uzivatele(e)
-                        odpoved = f"{odpoved}\n\n⚠️ Učení z paměti selhalo: {uceni_chyba}"
-                    st.write(odpoved)
-                except Exception as e:
-                    odpoved = zprava_pro_uzivatele(e)
-                    st.error(odpoved)
+                    extractor_prompt = f"Z následující zprávy uživatele extrahuj pouze nová trvalá fakta o něm (např. koníčky, práce, preference). Pokud žádná nová fakta nejsou, napiš 'NIC'. Zpráva: '{prompt}'"
+                    extractor_model = genai.GenerativeModel(PRIMARY_MODEL)
+                    extracted = extractor_model.generate_content(extractor_prompt).text.strip()
+                    if extracted and "NIC" not in extracted.upper():
+                        store_memory(user_id, extracted)
+                except Exception:
+                    pass
 
-        zpravy.append({"role": "assistant", "content": odpoved})
+with tab2:
+    st.header(f"Vzpomínky uživatele: {user_id}")
+    if st.button("Obnovit paměť"):
         st.rerun()
-
-with tab_pamet:
-    st.markdown(f"Vzpomínky uživatele **{active_user}**")
-    vzpominky = nacti_vzpominky_uzivatele(active_user)
-
-    if not vzpominky:
-        st.info("Pro tohoto uživatele zatím nejsou žádné vzpomínky.")
+    
+    user_mems = get_all_memories(user_id)
+    if user_mems:
+        for m in user_mems:
+            st.info(f"📌 {m}")
     else:
-        for zaznam in vzpominky:
-            point_id = zaznam["id"]
-            razitko, text_vzpominky = rozdel_razitko_a_text(zaznam.get("text", ""))
-            col_text, col_btn = st.columns([5, 1])
-            with col_text:
-                st.markdown(f"**{razitko}**")
-                st.write(text_vzpominky)
-            with col_btn:
-                if st.button("Smazat", key=f"smazat_{point_id}"):
-                    try:
-                        smaz_vzpominku(point_id)
-                        st.rerun()
-                    except Exception as e:
-                        st.error(formatuj_chybu(e))
-            st.divider()
+        st.write("Pro tohoto uživatele zatím nejsou žádné uložené vzpomínky.")
