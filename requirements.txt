@@ -1,4 +1,4 @@
 streamlit
+google-generativeai
 qdrant-client
-google-genai
 python-dotenv
