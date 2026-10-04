@@ -18,15 +18,16 @@ load_dotenv()
 
 DB_PATH = "./qdrant_db"
 GRAPH_DB_PATH = "znalostni_graf.db"
-GEN_MODEL = "gemini-3.1-flash-lite"
+GEN_MODEL = "gemini-3.6-flash"
 EMBED_MODEL = "gemini-embedding-001"
 QDRANT_COLLECTION = "zrcadlo_pamet"
-EMBED_DIM = 768
+EMBED_DIM = 3072
 REZIM_KREATIVNI = "Kreativní parťák"
 REZIM_TREZOR = "Striktní Trezor (NotebookLM)"
 HLASKA_API_VYTIZENE = (
     "Google API je momentálně vytížené, zkus to prosím za pár sekund znovu."
 )
+# 1. pokus + 1 retry při 429/503
 GEMINI_MAX_POKUSU = 3
 GEMINI_CEKANI_S = 2
 
@@ -144,21 +145,24 @@ def formatuj_chybu(exc: Exception) -> str:
 
 
 def je_prechodna_gemini_chyba(exc: Exception) -> bool:
-    """True u dočasných chyb 503 / ServerError / High Demand."""
+    """True u dočasných chyb 429/503."""
     if isinstance(exc, GeminiVytizeneError):
         return True
     kod = getattr(exc, "code", None) or getattr(exc, "status_code", None)
     text = str(exc).lower()
     nazev = type(exc).__name__.lower()
     return (
-        kod == 503
+        kod in (429, 503)
+        or "429" in text
         or "503" in text
+        or "resource_exhausted" in text
+        or "rate limit" in text
+        or "quota" in text
         or "servererror" in nazev
         or "server error" in text
         or "high demand" in text
         or "unavailable" in text
         or "overloaded" in text
-        or "resource_exhausted" in text
         or "vytížené" in text
     )
 
@@ -173,18 +177,14 @@ def zprava_pro_uzivatele(exc: Exception) -> str:
 
 
 def gemini_s_opakovanim(fn, pokusu: int = GEMINI_MAX_POKUSU):
-    """
-    Spustí Gemini volání s opakováním při 503 / ServerError / RuntimeError.
-    Po vyčerpání pokusů u vytížení vrátí přívětivou českou hlášku.
-    """
+    """Při 429/503 zopakuje volání jednou po 1 sekundě."""
     posledni = None
     for pokus in range(1, pokusu + 1):
         try:
             return fn()
         except Exception as e:
             posledni = e
-            opakovat = je_prechodna_gemini_chyba(e) or isinstance(e, RuntimeError)
-            if opakovat and pokus < pokusu:
+            if je_prechodna_gemini_chyba(e) and pokus < pokusu:
                 time.sleep(GEMINI_CEKANI_S)
                 continue
             break
@@ -209,7 +209,7 @@ def nacti_vzpominky_uzivatele(user_id: str) -> list:
                 with_vectors=False,
             )
             for p in points:
-                if p.payload.get("user_id", "karel") == user_id:
+                if p.payload.get("user_id", "") == user_id:
                     zaznamy.append(
                         {
                             "id": p.id,
@@ -268,15 +268,15 @@ columns = [col[1] for col in cursor.fetchall()]
 if not columns:
     cursor.execute(
         """
-        CREATE TABLE triples (
-            user_id TEXT DEFAULT 'karel',
+            CREATE TABLE triples (
+            user_id TEXT DEFAULT '',
             subject TEXT, relation TEXT, object TEXT,
             UNIQUE(user_id, subject, relation, object)
         )
         """
     )
 elif "user_id" not in columns:
-    cursor.execute("ALTER TABLE triples ADD COLUMN user_id TEXT DEFAULT 'karel'")
+    cursor.execute("ALTER TABLE triples ADD COLUMN user_id TEXT DEFAULT ''")
 
 conn.commit()
 conn.close()
@@ -284,7 +284,7 @@ conn.close()
 # --- BOČNÍ PANEL ---
 with st.sidebar:
     st.header("👤 Profil & Paměť")
-    active_user = st.text_input("Aktivní Uživatel (user_id):", value="karel").strip().lower()
+    active_user = st.text_input("Aktivní Uživatel (user_id):", value="lukas").strip().lower()
 
     st.divider()
     rezim = st.radio(
@@ -419,9 +419,8 @@ def posledni_vzpominky_texty(user_id: str, limit: int = 10) -> list:
 def uvitaci_zprava(user_id: str) -> str:
     """Úvodní zpráva Zrcadla po obnovení relace."""
     jmeno = (user_id or "").strip().capitalize() or "příteli"
-    osloveni = "Karle" if jmeno.lower() == "karel" else jmeno
     return (
-        f"Ahoj {osloveni}, vítám tě zpět! Procházím tvé uložené vzpomínky "
+        f"Ahoj {jmeno}, vítám tě zpět! Procházím tvé uložené vzpomínky "
         "a navazuji tam, kde jsme skončili. Na co se chceš dnes zaměřit?"
     )
 
