@@ -161,3 +161,13 @@ with tab2:
             st.info(f"📌 {m}")
     else:
         st.write("Pro tohoto uživatele zatím nejsou žádné uložené vzpomínky.")
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+import os
+
+# Servírování React frontendu
+if os.path.exists("frontend/dist"):
+    app.mount("/assets", StaticFiles(directory="frontend/dist/assets"), name="assets")
+    @app.get("/{full_path:path}")
+    def serve_react(full_path: str):
+        return FileResponse("frontend/dist/index.html")
