@@ -19,15 +19,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Cesty k souborům
 BASE_DIR = Path(__file__).resolve().parent.parent
 DIST_DIR = BASE_DIR / "frontend" / "dist"
 
 @app.on_event("startup")
 def startup_event():
     init_db()
-    print(f"[ZRCADLO] BASE_DIR: {BASE_DIR}")
-    print(f"[ZRCADLO] DIST_DIR: {DIST_DIR} | Existuje: {DIST_DIR.exists()}")
 
 class ChatRequest(BaseModel):
     user_id: str
@@ -62,12 +59,10 @@ def get_memories_endpoint(user_id: str):
     except Exception:
         return []
 
-# Servírování statických souborů (assets)
 assets_dir = DIST_DIR / "assets"
 if assets_dir.exists():
     app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
 
-# Hlavní odchytávání cest pro React frontend
 @app.get("/{full_path:path}")
 async def serve_react(full_path: str):
     if full_path.startswith("api/"):
@@ -83,6 +78,5 @@ async def serve_react(full_path: str):
     
     return {
         "status": "Chyba načtení frontendu",
-        "detail": f"Soubor index.html nebyl nalezen na adrese: {index_path}",
-        "dist_exists": DIST_DIR.exists()
+        "detail": f"Složka s frontendem nebyla nalezena na adrese: {index_path}"
     }
