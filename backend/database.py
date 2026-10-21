@@ -12,10 +12,11 @@ load_dotenv(_ROOT / ".env")
 load_dotenv()
 
 import sqlite3
+import threading
 import time
 import uuid
 from datetime import datetime
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
@@ -31,6 +32,10 @@ EMBED_DIM = 3072
 
 DB_MAX_POKUSU = 3
 DB_CEKANI_S = 2
+
+# Jeden sdílený klient — lokální path mode nesnese více instancí najednou.
+_qdrant_client: Optional[QdrantClient] = None
+_qdrant_client_lock = threading.Lock()
 
 
 def vytvor_qdrant_client() -> QdrantClient:
@@ -132,20 +137,26 @@ def je_chyba_404(exc: Exception) -> bool:
     return kod == 404 or "404" in text or "not found" in text or "doesn't exist" in text
 
 
+def get_qdrant_client() -> QdrantClient:
+    """Vrátí sdílenou instanci QdrantClient (bez opakovaného open/close path DB)."""
+    global _qdrant_client
+    with _qdrant_client_lock:
+        if _qdrant_client is None:
+            _qdrant_client = vytvor_qdrant_client()
+        return _qdrant_client
+
+
 def qdrant_operace(fn: Callable[[QdrantClient], Any]) -> Any:
     """Spustí operaci nad Qdrantem; při 404 znovu vytvoří kolekci a zopakuje."""
-    client = vytvor_qdrant_client()
+    client = get_qdrant_client()
+    zajisti_kolekci(client)
     try:
-        zajisti_kolekci(client)
-        try:
+        return fn(client)
+    except Exception as e:
+        if je_chyba_404(e):
+            zajisti_kolekci(client)
             return fn(client)
-        except Exception as e:
-            if je_chyba_404(e):
-                zajisti_kolekci(client)
-                return fn(client)
-            raise
-    finally:
-        client.close()
+        raise
 
 
 def init_graph_db() -> None:
@@ -183,13 +194,35 @@ def rozdel_razitko_a_text(text: str) -> tuple[str, str]:
     return "—", text
 
 
-def _scroll_vsechny_body(client: QdrantClient) -> list:
-    """Načte všechny body z kolekce přes stránkovaný scroll."""
+def _scroll_filter_user_id(user_id: str) -> Optional[models.Filter]:
+    """Stejný filtr user_id jako u chatového hledej_vzpominky."""
+    uid = (user_id or "").strip().lower()
+    if not uid:
+        return None
+    return models.Filter(
+        must=[
+            models.FieldCondition(
+                key="user_id",
+                match=models.MatchValue(value=uid),
+            )
+        ]
+    )
+
+
+def _scroll_vsechny_body(
+    client: QdrantClient, user_id: str = ""
+) -> list:
+    """
+    Načte body z kolekce přes stránkovaný scroll.
+    Pokud je user_id, filtruje stejně jako chat (payload.user_id).
+    """
     body = []
     offset = None
+    scroll_filter = _scroll_filter_user_id(user_id)
     while True:
         points, next_offset = client.scroll(
             collection_name=QDRANT_COLLECTION,
+            scroll_filter=scroll_filter,
             limit=100,
             offset=offset,
             with_payload=True,
@@ -256,17 +289,20 @@ def vypis_kolekce_qdrant(client: QdrantClient) -> list[str]:
 
 
 def nacti_vzpominky_uzivatele(user_id: str) -> list[dict]:
-    """Načte paměťové záznamy POUZE pro dané user_id (bez fallbacku na všechny body)."""
+    """
+    Načte vektorové vzpomínky z Qdrantu pro dané user_id.
+    Stejný zdroj, ze kterého chat bere uvítací přehled a (přes search) kontext.
+    """
+    uid = (user_id or "").strip().lower()
+    if not uid:
+        return []
 
     def _scroll_all(client: QdrantClient):
-        points = _scroll_vsechny_body(client)
-        uid = (user_id or "").strip().lower()
-        if uid:
-            points = [
-                p for p in points if _payload_user_id(p.payload or {}) == uid
-            ]
-        else:
-            points = []
+        points = _scroll_vsechny_body(client, user_id=uid)
+        # Pojistka pro starší body / odlišný casing v payloadu
+        points = [
+            p for p in points if _payload_user_id(p.payload or {}) == uid
+        ]
         zaznamy = []
         for p in points:
             payload = p.payload or {}
@@ -285,7 +321,8 @@ def nacti_vzpominky_uzivatele(user_id: str) -> list[dict]:
 
     try:
         return qdrant_operace(_scroll_all)
-    except Exception:
+    except Exception as e:
+        print(f"[Qdrant] nacti_vzpominky_uzivatele selhalo: {e}")
         return []
 
 
@@ -344,8 +381,24 @@ def smaz_grafove_vazby_pro_text(user_id: str, text: str) -> int:
 
 def smaz_vzpominku(point_id, user_id: str = "") -> None:
     """
-    Smaže vektor z Qdrantu a vyčistí související vazby ve znalostním grafu (SQLite).
+    Smaže vektor z Qdrantu (nebo řádek grafu při id graph-<rowid>)
+    a vyčistí související vazby ve znalostním grafu (SQLite).
     """
+    pid = str(point_id)
+    if pid.startswith("graph-"):
+        try:
+            rowid = int(pid.split("-", 1)[1])
+        except ValueError as e:
+            raise ValueError(f"Neplatné graph id: {pid}") from e
+        conn = sqlite3.connect(GRAPH_DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM triples WHERE rowid = ?", (rowid,))
+        smazano = cursor.rowcount
+        conn.commit()
+        conn.close()
+        print(f"[Graf] Smazán řádek rowid={rowid} (smazano={smazano})")
+        return
+
     nacteny_text = ""
     nacteny_user = (user_id or "").strip().lower()
 
@@ -379,54 +432,78 @@ def smaz_vzpominku(point_id, user_id: str = "") -> None:
 
 
 
+def _format_vzpominka_pro_frontend(zaznam: dict) -> dict:
+    """Formát {id, text, timestamp} očekávaný MemoryTab."""
+    text_val = zaznam.get("text", "") or ""
+    razitko, text_bez = rozdel_razitko_a_text(text_val)
+    display_text = text_bez if razitko != "—" else text_val
+    return {
+        "id": str(zaznam.get("id", "")),
+        "text": display_text,
+        "timestamp": zaznam.get("timestamp")
+        or _payload_timestamp({}, text_val)
+        or "Neznámé datum",
+    }
+
+
+def nacti_graf_jako_vzpominky(user_id: str) -> list[dict]:
+    """
+    Grafové vazby ze SQLite ve formátu paměti pro frontend.
+    Chat je čte přes nacti_graf — sem je dáme, aby Správa paměti viděla totéž.
+    """
+    uid = (user_id or "").strip().lower()
+    if not uid:
+        return []
+    conn = sqlite3.connect(GRAPH_DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT rowid, subject, relation, object FROM triples WHERE user_id = ?",
+        (uid,),
+    )
+    radky = cursor.fetchall()
+    conn.close()
+    return [
+        {
+            "id": f"graph-{rowid}",
+            "text": f"[{sub}] -> ({rel}) -> [{obj}]",
+            "timestamp": "Graf",
+        }
+        for rowid, sub, rel, obj in radky
+    ]
+
+
 def seznam_vzpominek_api(user_id: str = "") -> list[dict]:
     """
-    GET /api/memories — načte VŠECHNY body bez filtru user_id,
-    vypíše debug info do konzole a vrátí [{id, text, timestamp}].
+    GET /api/memories — stejné zdroje jako chat:
+    1) Qdrant body pro user_id (vektorové vzpomínky)
+    2) SQLite triples (grafové vazby)
+    Vrací [{id, text, timestamp}] pro frontend.
     """
-
-    def _nacti_vse(client: QdrantClient):
-        vypis_kolekce_qdrant(client)
-        print(
-            f"[Qdrant] Scroll všech bodů z kolekce '{QDRANT_COLLECTION}' "
-            f"(bez filtru user_id; požadavek user_id={user_id!r})"
-        )
-        points = _scroll_vsechny_body(client)
-        print(f"[Qdrant] Načteno bodů: {len(points)}")
-
-        vysledek = []
-        for p in points:
-            payload = p.payload or {}
-            print(f"Point {p.id}: {payload}")
-            text_val = _payload_text(payload)
-            if not text_val:
-                # žádný textový obsah — přeskoč, ale payload už je ve výpisu
-                continue
-            razitko, text_bez = rozdel_razitko_a_text(text_val)
-            timestamp = _payload_timestamp(payload, text_val)
-            display_text = text_bez if razitko != "—" else text_val
-            vysledek.append(
-                {
-                    "id": str(p.id),
-                    "text": display_text,
-                    "timestamp": timestamp,
-                }
-            )
-        print(f"[Qdrant] Bodů s textovým obsahem pro frontend: {len(vysledek)}")
-        return vysledek
-
-    try:
-        return qdrant_operace(_nacti_vse)
-    except Exception as e:
-        print(f"[Qdrant] Chyba při načítání vzpomínek: {e}")
+    uid = (user_id or "").strip().lower()
+    if not uid:
         return []
+
+    print(
+        f"[Paměť] GET memories (Qdrant+graf) kolekce={QDRANT_COLLECTION!r} "
+        f"user_id={uid!r}"
+    )
+    zaznamy = nacti_vzpominky_uzivatele(uid)
+    vysledek = [_format_vzpominka_pro_frontend(z) for z in zaznamy]
+    grafove = nacti_graf_jako_vzpominky(uid)
+    vysledek.extend(grafove)
+    print(
+        f"[Paměť] Memories pro frontend: {len(vysledek)} "
+        f"(qdrant={len(zaznamy)}, graf={len(grafove)})"
+    )
+    return vysledek
 
 
 def export_vzpominek(user_id: str) -> dict:
     """JSON kontejner se všemi vzpomínkami a metadaty uživatele."""
-    memories = seznam_vzpominek_api(user_id)
+    uid = (user_id or "").strip().lower()
+    memories = seznam_vzpominek_api(uid)
     return {
-        "user_id": user_id,
+        "user_id": uid,
         "exported_at": datetime.now().isoformat(timespec="seconds"),
         "count": len(memories),
         "memories": memories,

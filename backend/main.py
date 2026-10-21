@@ -67,7 +67,9 @@ class DeleteMemoryResponse(BaseModel):
 
 
 def _parse_point_id(memory_id: str) -> Any:
-    """Qdrant očekává UUID objekt nebo int; string UUID převedeme."""
+    """Qdrant očekává UUID/int; graph-<rowid> necháváme jako string."""
+    if memory_id.startswith("graph-"):
+        return memory_id
     try:
         return UUID(memory_id)
     except ValueError:
