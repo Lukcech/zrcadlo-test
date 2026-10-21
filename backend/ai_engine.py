@@ -5,24 +5,21 @@ from __future__ import annotations
 
 from dotenv import load_dotenv
 import os
+from pathlib import Path
 
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 load_dotenv()
 
 import json
 import time
-from pathlib import Path
 from typing import Callable, Optional
 
 from google import genai
 from google.genai import types
 
-# Kořenový .env má přednost (override=True)
-_ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
-load_dotenv(_ENV_PATH, override=True)
-
 from . import database as db
 
-# Primární lite (stabilní, bez 503); fallback plný flash
+# Primární lite (stabilní); fallback plný flash
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
 FALLBACK_MODEL = "gemini-3.5-flash"
 MODEL_NAME = os.getenv("GEMINI_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
@@ -42,7 +39,7 @@ GEN_CEKANI_S = 1.5
 GEMINI_MAX_POKUSU = 3
 GEMINI_CEKANI_S = 2
 
-_genai_client: Optional[genai.Client] = None
+_genai_client: genai.Client | None = None
 
 
 class GeminiVytizeneError(RuntimeError):
@@ -50,26 +47,19 @@ class GeminiVytizeneError(RuntimeError):
 
 
 def nacti_api_klic() -> str:
-    """Načte Gemini klíč výhradně z GEMINI_API_KEY (fallback API_KEY)."""
-    raw_key = os.getenv("GEMINI_API_KEY") or os.getenv("API_KEY") or ""
-    api_key = raw_key.strip().strip("'\"")
-    if not api_key or api_key in {"tvuj_gemini_api_klic", ""}:
-        print(
-            "⚠️ VAROVÁNÍ: GEMINI_API_KEY chybí v .env "
-            f"({_ENV_PATH}). Gemini klient nebude fungovat."
-        )
-        raise ValueError(
-            "Gemini API klíč nebyl nalezen. Nastav GEMINI_API_KEY v .env."
-        )
-    print(f"[Gemini] API klíč načten z .env ({api_key[:8]}…)")
-    return api_key
+    """Načte Gemini klíč z GEMINI_API_KEY nebo API_KEY."""
+    klic = os.getenv("GEMINI_API_KEY") or os.getenv("API_KEY")
+    if klic and klic not in {"tvuj_gemini_api_klic", ""}:
+        return klic
+    raise ValueError(
+        "Gemini API klíč nebyl nalezen. Nastav GEMINI_API_KEY nebo API_KEY v .env."
+    )
 
 
 def get_genai_client() -> genai.Client:
     global _genai_client
     if _genai_client is None:
-        api_key = nacti_api_klic()
-        _genai_client = genai.Client(api_key=api_key)
+        _genai_client = genai.Client(api_key=nacti_api_klic())
     return _genai_client
 
 
@@ -85,8 +75,7 @@ def _normalizuj_nazev_modelu(nazev: str) -> str:
 
 def vyber_model(model: Optional[str] = None) -> str:
     """Výchozí gemini-3.5-flash-lite; frontend může přepsat."""
-    kandidat = _normalizuj_nazev_modelu((model or "").strip() or MODEL_NAME)
-    return kandidat
+    return _normalizuj_nazev_modelu((model or "").strip() or MODEL_NAME)
 
 
 def normalizuj_rezim(mode: str) -> str:
@@ -406,59 +395,40 @@ def generuj_odpoved(
     teplota = teplota_pro_rezim(rezim)
     model_name = vyber_model(model)
 
-    uvitaci = [t for t in (uvitaci_kontext or []) if t and str(t).strip()]
-    vektory_ciste = [t for t in (vektory or []) if t and str(t).strip()]
-    graf_cisty = [t for t in (graf or []) if t and str(t).strip()]
-
-    # Jen unikátní dynamické vzpomínky — žádná natvrdo napsaná fakta o uživateli
-    spojene = []
-    videne = set()
-    for text_item in list(uvitaci) + list(vektory_ciste):
-        if text_item and text_item not in videne:
-            spojene.append(text_item)
-            videne.add(text_item)
-
-    ma_pamet = bool(spojene or graf_cisty)
-
     if rezim == REZIM_TREZOR:
         pravidla = f"""
 Jsi Zrcadlo v režimu Striktní Trezor (NotebookLM) pro uživatele '{user_id}'.
 
-PRAVIDLA ROLE:
-- Odpovídej VÝHRADNĚ z dynamicky dodaných paměťových faktů níže (vzpomínky / graf).
+PRAVIDLA:
+- Odpovídej VÝHRADNĚ na základě nalezených paměťových faktů: vektorových vzpomínek a grafových vazeb.
 - Historii chatu používej jen k pochopení otázky, ne jako zdroj nových faktů.
-- Pokud informace v dodaných sekcích není, řekni: „Tuto informaci v databázi nemám.“
-- NIKDY nevymýšlej a NIKDY nepoužívej fakta o uživateli z tréninkových dat ani z paměti modelu.
-- Pokud jsou sekce vzpomínek/grafu prázdné, nemáš o uživateli žádné uložené znalosti.
+- Pokud informace v databázi (vzpomínkách / grafu) není, explicitně to přiznej, např.:
+  „Tuto informaci v databázi nemám.“
+- Nevymýšlej, nedoplňuj a neodvozuj nepodložené detaily.
+- Cituj nebo parafrázuj jen to, co je ve VEKTOROVÝCH VZPOMÍNKÁCH nebo GRAFOVÝCH VAZBÁCH.
+- Na začátku vzpomínek může být časové razítko [DD.MM.YYYY HH:MM] — ber ho v potaz.
+- UVÍTACÍ PAMĚŤOVÝ PŘEHLED používej jako obnovený kontext po restartu relace.
 """
     else:
         pravidla = f"""
-Jsi Zrcadlo, empatický AI průvodce (Kreativní parťák) pro uživatele '{user_id}'.
+Jsi Zrcadlo, empatický AI průvodce (Kreativní parťák) uživatele '{user_id}'.
 
-PRAVIDLA ROLE:
-- Vycházej POUZE z dynamicky dodaných faktů níže (vzpomínky, graf, historie chatu).
-- NIKDY nevymýšlej a NIKDY nepoužívej natvrdo zapamatované údaje o uživateli (povolání, rodina, zdraví, preference atd.), pokud nejsou výslovně v sekcích níže.
-- Pokud jsou vzpomínky a graf prázdné, kontext je zcela čistý — neznáš o uživateli nic mimo aktuální zprávu a historii této relace.
+PRAVIDLA:
+- Vycházej primárně ze zadaných faktů: vektorových vzpomínek, grafových vazeb a historie chatu.
+- Nevymýšlej si nepodložené detaily, události, jména ani pocity, které v podkladech nejsou.
 - Pokud něco nevíš, otevřeně to řekni. Nehalucinuj.
-- Odpovídej přátelsky, přímo a s pochopením.
+- Na začátku vzpomínek může být časové razítko [DD.MM.YYYY HH:MM] — ber ho v potaz.
+- Odpovídej přátelsky, přímo a s pochopením a plynule navazuj na krátkodobou historii chatu.
+- UVÍTACÍ PAMĚŤOVÝ PŘEHLED obsahuje poslední vzpomínky načtené po restartu — navazuj na ně.
 """
 
-    if ma_pamet:
-        pametovy_blok = f"""
-UVÍTACÍ PAMĚŤOVÝ PŘEHLED:
-{chr(10).join(uvitaci) if uvitaci else "(prázdné)"}
-
-VEKTOROVÉ VZPOMÍNKY:
-{chr(10).join(spojene) if spojene else "(prázdné)"}
-
-GRAFOVÉ VAZBY:
-{chr(10).join(graf_cisty) if graf_cisty else "(prázdné)"}
-"""
-    else:
-        pametovy_blok = """
-PAMĚŤOVÝ KONTEXT: prázdný.
-O uživateli nemáš žádné uložené vzpomínky ani grafové vazby. Neuváděj žádná fakta o něm, která neuvedl v této konverzaci.
-"""
+    uvitaci = uvitaci_kontext or []
+    spojene = []
+    videne = set()
+    for text in list(uvitaci) + list(vektory):
+        if text and text not in videne:
+            spojene.append(text)
+            videne.add(text)
 
     prompt = f"""
 {pravidla}
@@ -469,7 +439,14 @@ DOTAZ UŽIVATELE ({user_id}):
 KRÁTKODOBÁ PAMĚŤ (poslední zprávy tohoto chatu):
 {formatuj_historii_chatu(historie_chatu, limit=5)}
 
-{pametovy_blok}
+UVÍTACÍ PAMĚŤOVÝ PŘEHLED (poslední vzpomínky po restartu):
+{chr(10).join(uvitaci) if uvitaci else "Žádný uvítací přehled."}
+
+VEKTOROVÉ VZPOMÍNKY (relevantní k dotazu, až 10):
+{chr(10).join(spojene) if spojene else "Žádné předchozí vzpomínky."}
+
+GRAFOVÉ VAZBY:
+{chr(10).join(graf) if graf else "Žádné předchozí grafové vazby."}
 """
     return generuj_text_s_retry_a_fallback(prompt, model_name, teplota)
 
@@ -481,8 +458,14 @@ def zpracuj_zpravu(
     historie_chatu: Optional[list[dict]] = None,
     uvitaci_kontext: Optional[list[str]] = None,
     model: Optional[str] = None,
+    **kwargs,
 ) -> str:
-    """Kompletní chat pipeline: kontext → odpověď → učení (učení nesmí shodit chat)."""
+    """Kompletní chat pipeline: kontext → odpověď → učení.
+    Volitelný parametr model (nebo kwargs['model']) nesmí způsobit TypeError.
+    """
+    if model is None and "model" in kwargs:
+        model = kwargs.get("model")
+
     historie = list(historie_chatu or [])
     if uvitaci_kontext is None:
         uvitaci_kontext = db.posledni_vzpominky_texty(user_id, limit=10)
@@ -502,14 +485,12 @@ def zpracuj_zpravu(
         model=model,
     )
 
-    # Pauza proti sekundovému burst limitu před extrakcí paměti
     time.sleep(1.0)
 
     print("👉 3/3: Extrahuji vzpomínky...")
     try:
         uc_se_z_zpravy(message, user_id, model=model)
     except Exception as e:
-        # 429 / Quota Exceeded / jakákoliv chyba — chat dál vrátí odpověď z kroku 2
         print(f"Paměť přeskočena z důvodu kvóty: {e}")
 
     return odpoved

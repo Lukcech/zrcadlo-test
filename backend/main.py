@@ -1,15 +1,20 @@
-import os
-from pathlib import Path
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
-from backend.database import init_db, qdrant, COLLECTION_NAME
-from backend.ai_engine import generate_response
-from qdrant_client.http import models
+# -*- coding: utf-8 -*-
+"""FastAPI backend pro Projekt Zrcadlo."""
 
-app = FastAPI(title="Zrcadlo API")
+from __future__ import annotations
+
+from typing import Any, Optional
+from uuid import UUID
+
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+from . import ai_engine
+from . import database as db
+
+app = FastAPI(title="Projekt Zrcadlo API", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -19,64 +24,187 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-DIST_DIR = BASE_DIR / "frontend" / "dist"
+# Krátkodobá paměť chatu na straně serveru (per user_id)
+_chat_histories: dict[str, list[dict]] = {}
+_welcome_context: dict[str, list[str]] = {}
 
-@app.on_event("startup")
-def startup_event():
-    init_db()
 
 class ChatRequest(BaseModel):
-    user_id: str
-    message: str
-    persona: str = "Kreativní parťák"
-
-@app.post("/api/chat")
-def chat_endpoint(req: ChatRequest):
-    reply = generate_response(
-        user_id=req.user_id,
-        prompt=req.message,
-        user_persona=req.persona
+    user_id: str = Field(..., min_length=1, description="Identifikátor uživatele")
+    message: str = Field(..., min_length=1, description="Zpráva uživatele")
+    mode: str = Field(
+        default=ai_engine.REZIM_KREATIVNI,
+        description="Kreativní parťák | Striktní Trezor (NotebookLM)",
     )
-    return {"reply": reply}
+    model: Optional[str] = Field(
+        default=None,
+        description="Volitelný Gemini model (např. gemini-3.5-flash-lite)",
+    )
 
-@app.get("/api/memories/{user_id}")
-def get_memories_endpoint(user_id: str):
+
+class ChatResponse(BaseModel):
+    user_id: str
+    mode: str
+    reply: str
+    welcome: Optional[str] = None
+
+
+class MemoryItem(BaseModel):
+    id: str
+    text: str
+    timestamp: Optional[str] = None
+
+
+class MemoriesResponse(BaseModel):
+    user_id: str
+    count: int
+    memories: list[MemoryItem]
+
+
+class DeleteMemoryResponse(BaseModel):
+    ok: bool
+    memory_id: str
+
+
+def _parse_point_id(memory_id: str) -> Any:
+    """Qdrant očekává UUID objekt nebo int; string UUID převedeme."""
     try:
-        results = qdrant.scroll(
-            collection_name=COLLECTION_NAME,
-            scroll_filter=models.Filter(
-                must=[
-                    models.FieldCondition(
-                        key="user_id",
-                        match=models.MatchValue(value=user_id)
-                    )
-                ]
-            ),
-            limit=100
-        )[0]
-        return [{"id": hit.id, "text": hit.payload["text"]} for hit in results]
-    except Exception:
-        return []
+        return UUID(memory_id)
+    except ValueError:
+        if memory_id.isdigit():
+            return int(memory_id)
+        return memory_id
 
-assets_dir = DIST_DIR / "assets"
-if assets_dir.exists():
-    app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
 
-@app.get("/{full_path:path}")
-async def serve_react(full_path: str):
-    if full_path.startswith("api/"):
-        return {"detail": "Not Found"}
-    
-    file_path = DIST_DIR / full_path
-    if file_path.exists() and file_path.is_file():
-        return FileResponse(str(file_path))
-    
-    index_path = DIST_DIR / "index.html"
-    if index_path.exists():
-        return FileResponse(str(index_path))
-    
-    return {
-        "status": "Chyba načtení frontendu",
-        "detail": f"Složka s frontendem nebyla nalezena na adrese: {index_path}"
-    }
+@app.on_event("startup")
+def startup() -> None:
+    db.init_graph_db()
+
+
+@app.get("/api/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/api/chat", response_model=ChatResponse)
+def chat(req: ChatRequest):
+    user_id = req.user_id.strip().lower()
+    mode = ai_engine.normalizuj_rezim(req.mode)
+    message = req.message.strip()
+
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id nesmí být prázdný.")
+    if not message:
+        raise HTTPException(status_code=400, detail="Zpráva nesmí být prázdná.")
+
+    if user_id not in _chat_histories:
+        _chat_histories[user_id] = []
+    historie = _chat_histories[user_id]
+
+    welcome_msg = None
+    if not historie:
+        _welcome_context[user_id] = db.posledni_vzpominky_texty(user_id, limit=10)
+        welcome_msg = ai_engine.uvitaci_zprava(user_id)
+        historie.append({"role": "assistant", "content": welcome_msg})
+
+    historie.append({"role": "user", "content": message})
+
+    try:
+        reply = ai_engine.zpracuj_zpravu(
+            user_id=user_id,
+            message=message,
+            mode=mode,
+            historie_chatu=historie[:-1],
+            uvitaci_kontext=_welcome_context.get(user_id, []),
+            model=req.model,
+        )
+    except ai_engine.GeminiVytizeneError as e:
+        print(f"❌ DETEKTOVÁNA CHYBA GEMINI API: {type(e).__name__} - {e}")
+        # Uživatelsky přívětivá odpověď místo chybového JSON
+        reply = str(e).strip() or ai_engine.HLASKA_API_NEDOSTUPNE
+    except Exception as e:
+        print(f"❌ DETEKTOVÁNA CHYBA GEMINI API: {type(e).__name__} - {e}")
+        if ai_engine.je_prechodna_gemini_chyba(e) or ai_engine.je_rate_limit_429(e):
+            reply = ai_engine.HLASKA_API_NEDOSTUPNE
+        else:
+            historie.pop()
+            raise HTTPException(
+                status_code=500,
+                detail=ai_engine.zprava_pro_uzivatele(e),
+            )
+
+    historie.append({"role": "assistant", "content": reply})
+
+    return ChatResponse(
+        user_id=user_id,
+        mode=mode,
+        reply=reply,
+        welcome=welcome_msg,
+    )
+
+
+@app.get("/api/memories", response_model=MemoriesResponse)
+def list_memories(user_id: str = Query(..., min_length=1)):
+    uid = user_id.strip().lower()
+    if not uid:
+        raise HTTPException(status_code=400, detail="user_id nesmí být prázdný.")
+    print(f"[API] GET /api/memories user_id={uid!r}")
+    try:
+        raw = db.seznam_vzpominek_api(uid)
+    except Exception as e:
+        print(f"[API] GET /api/memories chyba: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    memories = [
+        MemoryItem(
+            id=m["id"],
+            text=m["text"],
+            timestamp=m.get("timestamp") or "Neznámé datum",
+        )
+        for m in raw
+    ]
+    print(f"[API] GET /api/memories → {len(memories)} položek pro frontend")
+    return MemoriesResponse(user_id=uid, count=len(memories), memories=memories)
+
+
+@app.delete("/api/memories/{memory_id}", response_model=DeleteMemoryResponse)
+def delete_memory(
+    memory_id: str,
+    user_id: str = Query("", description="Volitelné user_id pro čištění grafu"),
+):
+    point_id = _parse_point_id(memory_id)
+    print(f"[API] DELETE /api/memories/{memory_id} user_id={user_id!r}")
+    try:
+        db.smaz_vzpominku(point_id, user_id=user_id.strip().lower() if user_id else "")
+    except Exception as e:
+        print(f"[API] DELETE memory chyba: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Smazání vzpomínky selhalo: {e}",
+        )
+    return DeleteMemoryResponse(ok=True, memory_id=str(memory_id))
+
+
+@app.get("/api/export")
+def export_memories(user_id: str = Query(..., min_length=1)):
+    uid = user_id.strip().lower()
+    if not uid:
+        raise HTTPException(status_code=400, detail="user_id nesmí být prázdný.")
+    try:
+        payload = db.export_vzpominek(uid)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    filename = f"{uid}_zrcadlo_memory.json"
+    return JSONResponse(
+        content=payload,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+        },
+    )
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("backend.main:app", host="0.0.0.0", port=8000, reload=True)

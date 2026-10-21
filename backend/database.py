@@ -7,8 +7,8 @@ from dotenv import load_dotenv
 import os
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(ROOT / ".env", override=True)
+_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(_ROOT / ".env")
 load_dotenv()
 
 import sqlite3
@@ -19,167 +19,129 @@ from typing import Any, Callable
 
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
-from qdrant_client.models import Distance, VectorParams
+from qdrant_client.models import Distance, PointStruct, VectorParams
 
-try:
-    from pydantic import ValidationError
-except ImportError:  # pragma: no cover
-    ValidationError = Exception  # type: ignore[misc, assignment]
-
+ROOT = _ROOT
 DB_PATH = str(ROOT / "qdrant_db")
 GRAPH_DB_PATH = str(ROOT / "znalostni_graf.db")
 QDRANT_COLLECTION = "zrcadlo_pamet"
-# Ověřeno test_step_by_step / list_models: embedContent → gemini-embedding-001, dim 3072
+# Ověřeno test_step_by_step: gemini-embedding-001 → dim 3072
 EMBED_MODEL = "gemini-embedding-001"
 EMBED_DIM = 3072
-
-
-def nacti_gemini_api_klic() -> str:
-    """Stejný klíč jako ai_engine — GEMINI_API_KEY z .env (pro konzistenci)."""
-    raw = os.getenv("GEMINI_API_KEY") or os.getenv("API_KEY") or ""
-    key = raw.strip().strip("'\"")
-    if not key:
-        raise ValueError("GEMINI_API_KEY chybí v .env")
-    return key
 
 DB_MAX_POKUSU = 3
 DB_CEKANI_S = 2
 
 
 def vytvor_qdrant_client() -> QdrantClient:
-    """Připojení k Qdrant Cloudu z env, jinak lokální úložiště."""
-    url = os.getenv("QDRANT_URL")
-    api_key = os.getenv("QDRANT_API_KEY")
-    placeholder = {"tvoje_qdrant_url", "tvuj_qdrant_api_klic", ""}
-    if url and api_key and url not in placeholder and api_key not in placeholder:
-        return QdrantClient(url=url, api_key=api_key)
+    """
+    Připojení k Qdrantu:
+    - Pokud je nastaveno QDRANT_URL → cloud/remote (api_key z QDRANT_API_KEY, může být prázdný).
+    - Jinak lokální diskové úložiště (./qdrant_db) — lokální běh beze změny.
+    """
+    raw_url = os.getenv("QDRANT_URL") or ""
+    raw_key = os.getenv("QDRANT_API_KEY") or ""
+    url = raw_url.strip().strip("'\"")
+    api_key = raw_key.strip().strip("'\"")
+
+    # Placeholder hodnoty z šablon nepovažuj za platné připojení
+    placeholders = {
+        "",
+        "tvoje_qdrant_url",
+        "tvuj_qdrant_api_klic",
+        "your_qdrant_url",
+        "your_qdrant_api_key",
+    }
+
+    if url and url not in placeholders:
+        print(f"[Qdrant] Remote připojení: {url}")
+        if api_key and api_key not in placeholders:
+            return QdrantClient(url=url, api_key=api_key)
+        return QdrantClient(url=url)
+
+    print(f"[Qdrant] Lokální úložiště: {DB_PATH}")
     return QdrantClient(path=DB_PATH)
 
 
-def ensure_collection_exists(
-    client: QdrantClient,
-    collection_name: str = QDRANT_COLLECTION,
-) -> None:
-    """
-    Bezpečně zajistí existenci kolekce s VectorParams(size=EMBED_DIM, COSINE).
-    Nikdy nemaže ani nerecreatuje existující kolekci (ochrana lokálních dat).
-    """
+def zajisti_kolekci(client: QdrantClient) -> None:
+    """Vytvoří kolekci zrcadlo_pamet, pokud ještě neexistuje."""
     existuje = False
     try:
         if hasattr(client, "collection_exists"):
-            existuje = bool(client.collection_exists(collection_name=collection_name))
+            existuje = client.collection_exists(collection_name=QDRANT_COLLECTION)
         else:
             jmena = [c.name for c in client.get_collections().collections]
-            existuje = collection_name in jmena
-    except Exception as e:
-        print(f"[Qdrant] Kontrola existence kolekce '{collection_name}' selhala: {e}")
+            existuje = QDRANT_COLLECTION in jmena
+    except Exception:
         existuje = False
 
-    if existuje:
-        print(
-            f"[Qdrant] Kolekce '{collection_name}' už existuje "
-            f"(očekávaná dimenze EMBED_DIM={EMBED_DIM}, COSINE) — nepřetvářím."
-        )
-        return
-
-    try:
+    if not existuje:
         client.create_collection(
-            collection_name=collection_name,
+            collection_name=QDRANT_COLLECTION,
             vectors_config=VectorParams(size=3072, distance=Distance.COSINE),
         )
-        print(
-            f"[Qdrant] Vytvořena kolekce '{collection_name}' "
-            f"(dim=3072, distance=COSINE)."
-        )
-    except ValidationError as e:
-        print(
-            f"[Qdrant] ValidationError při create_collection('{collection_name}'): {e} "
-            "— kolekci nepřetvářím."
-        )
-    except Exception as e:
-        text = str(e).lower()
-        if "already" in text or "exists" in text or "409" in text:
-            print(
-                f"[Qdrant] Kolekce '{collection_name}' už existuje (create race) — OK."
-            )
-        else:
-            print(f"[Qdrant] create_collection('{collection_name}') selhalo: {e}")
+        print(f"[Qdrant] Kolekce '{QDRANT_COLLECTION}' vytvořena (dim=3072, COSINE).")
 
 
-def zajisti_kolekci(client: QdrantClient) -> None:
-    """Alias / tenký obal nad ensure_collection_exists pro výchozí kolekci."""
-    ensure_collection_exists(client, QDRANT_COLLECTION)
+def ensure_collection_exists(
+    client: QdrantClient, collection_name: str = QDRANT_COLLECTION
+) -> None:
+    """Alias pro zajisti_kolekci."""
+    zajisti_kolekci(client)
 
 
 def _je_prechodna_db_chyba(exc: Exception) -> bool:
-    """True, pokud výjimka vypadá jako dočasná (retry dává smysl)."""
     text = str(exc).lower()
-    klicova = (
-        "timeout",
-        "timed out",
-        "connection",
-        "temporarily",
-        "unavailable",
-        "rate limit",
-        "too many requests",
-        "429",
-        "502",
-        "503",
-        "504",
-        "locked",
-        "busy",
-        "retry",
-        "broken pipe",
-        "reset by peer",
-        "resource temporarily",
-        "deadline",
+    nazev = type(exc).__name__.lower()
+    kod = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    return (
+        kod in (429, 503)
+        or "429" in text
+        or "503" in text
+        or "resourceexhausted" in nazev
+        or "resource_exhausted" in text
+        or "rate limit" in text
+        or "quota" in text
+        or "timeout" in text
+        or "unavailable" in text
     )
-    return any(k in text for k in klicova)
 
 
-def s_opakovanim(fn: Callable[[], Any], popisek: str = "operace") -> Any:
-    """Spustí fn až DB_MAX_POKUSU×; při přechodné chybě čeká DB_CEKANI_S sekund."""
-    posledni: Exception | None = None
+def s_opakovanim(fn: Callable, popisek: str = "operace"):
+    """Až 3 pokusy s pauzou 2 s při přechodných chybách."""
+    posledni = None
     for pokus in range(1, DB_MAX_POKUSU + 1):
         try:
             return fn()
         except Exception as e:
             posledni = e
-            if not _je_prechodna_db_chyba(e) or pokus >= DB_MAX_POKUSU:
-                raise
-            print(
-                f"[DB] {popisek}: přechodná chyba "
-                f"(pokus {pokus}/{DB_MAX_POKUSU}): {e}; "
-                f"čekám {DB_CEKANI_S}s…"
-            )
-            time.sleep(DB_CEKANI_S)
-    assert posledni is not None
-    raise posledni
+            if _je_prechodna_db_chyba(e) and pokus < DB_MAX_POKUSU:
+                print(
+                    f"[DB] {popisek}: přechodná chyba "
+                    f"(pokus {pokus}/{DB_MAX_POKUSU}), čekám {DB_CEKANI_S}s"
+                )
+                time.sleep(DB_CEKANI_S)
+                continue
+            raise
+    raise posledni  # type: ignore[misc]
 
 
 def je_chyba_404(exc: Exception) -> bool:
-    """True, pokud výjimka vypadá jako chybějící kolekce (404 / Not Found)."""
     kod = getattr(exc, "status_code", None) or getattr(exc, "code", None)
     text = str(exc).lower()
-    return (
-        kod == 404
-        or "404" in text
-        or "not found" in text
-        or "doesn't exist" in text
-        or "does not exist" in text
-    )
+    return kod == 404 or "404" in text or "not found" in text or "doesn't exist" in text
 
 
 def qdrant_operace(fn: Callable[[QdrantClient], Any]) -> Any:
-    """Spustí operaci nad Qdrantem; při 404 znovu zajistí kolekci a zopakuje."""
+    """Spustí operaci nad Qdrantem; při 404 znovu vytvoří kolekci a zopakuje."""
     client = vytvor_qdrant_client()
     try:
-        ensure_collection_exists(client, QDRANT_COLLECTION)
+        zajisti_kolekci(client)
         try:
             return fn(client)
         except Exception as e:
             if je_chyba_404(e):
-                ensure_collection_exists(client, QDRANT_COLLECTION)
+                zajisti_kolekci(client)
                 return fn(client)
             raise
     finally:
@@ -264,6 +226,7 @@ def _payload_text(payload: dict) -> str:
         val = payload.get(key)
         if val is not None and str(val).strip():
             return str(val)
+    # Fallback: první stringová hodnota v payloadu
     for val in payload.values():
         if isinstance(val, str) and val.strip():
             return val
@@ -415,6 +378,7 @@ def smaz_vzpominku(point_id, user_id: str = "") -> None:
         print("[Graf] user_id neznámý — graf nepročištěn")
 
 
+
 def seznam_vzpominek_api(user_id: str = "") -> list[dict]:
     """
     GET /api/memories — načte VŠECHNY body bez filtru user_id,
@@ -436,6 +400,7 @@ def seznam_vzpominek_api(user_id: str = "") -> list[dict]:
             print(f"Point {p.id}: {payload}")
             text_val = _payload_text(payload)
             if not text_val:
+                # žádný textový obsah — přeskoč, ale payload už je ve výpisu
                 continue
             razitko, text_bez = rozdel_razitko_a_text(text_val)
             timestamp = _payload_timestamp(payload, text_val)
