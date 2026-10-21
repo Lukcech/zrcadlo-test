@@ -423,11 +423,12 @@ PRAVIDLA:
 """
 
     uvitaci = uvitaci_kontext or []
-    spojene = []
-    videne = set()
-    for text in list(uvitaci) + list(vektory):
+    # Uvítací texty jen v sekci UVÍTACÍ — nezdvojovat ve VEKTOROVÝCH VZPOMÍNKÁCH
+    vektory_jedinecne = []
+    videne = set(uvitaci)
+    for text in vektory:
         if text and text not in videne:
-            spojene.append(text)
+            vektory_jedinecne.append(text)
             videne.add(text)
 
     prompt = f"""
@@ -443,7 +444,7 @@ UVÍTACÍ PAMĚŤOVÝ PŘEHLED (poslední vzpomínky po restartu):
 {chr(10).join(uvitaci) if uvitaci else "Žádný uvítací přehled."}
 
 VEKTOROVÉ VZPOMÍNKY (relevantní k dotazu, až 10):
-{chr(10).join(spojene) if spojene else "Žádné předchozí vzpomínky."}
+{chr(10).join(vektory_jedinecne) if vektory_jedinecne else "Žádné předchozí vzpomínky."}
 
 GRAFOVÉ VAZBY:
 {chr(10).join(graf) if graf else "Žádné předchozí grafové vazby."}
@@ -460,21 +461,22 @@ def zpracuj_zpravu(
     model: Optional[str] = None,
     **kwargs,
 ) -> str:
-    """Kompletní chat pipeline: kontext → odpověď → učení.
-    Volitelný parametr model (nebo kwargs['model']) nesmí způsobit TypeError.
+    """Chat pipeline: kontext → odpověď.
+    Učení (extrakce faktů) probíhá mimo — přes BackgroundTasks v main.py.
     """
     if model is None and "model" in kwargs:
         model = kwargs.get("model")
 
     historie = list(historie_chatu or [])
+    # Načti uvítací kontext jen když volající nic nepředal (žádná duplicita s main.py)
     if uvitaci_kontext is None:
         uvitaci_kontext = db.posledni_vzpominky_texty(user_id, limit=10)
 
-    print("👉 1/3: Vytvářím embedding dotazu...")
+    print("👉 1/2: Vytvářím embedding dotazu a načítám kontext...")
     vektory, graf = ziskej_kontext(message, user_id)
 
-    print("👉 2/3: Generuji odpověď Zrcadla...")
-    odpoved = generuj_odpoved(
+    print("👉 2/2: Generuji odpověď Zrcadla...")
+    return generuj_odpoved(
         message,
         vektory,
         graf,
@@ -485,12 +487,14 @@ def zpracuj_zpravu(
         model=model,
     )
 
-    time.sleep(1.0)
 
-    print("👉 3/3: Extrahuji vzpomínky...")
+def uc_se_na_pozadi(
+    zprava: str, user_id: str, model: Optional[str] = None
+) -> None:
+    """Wrapper pro BackgroundTasks — chyby nesmí shodit worker."""
+    print("👉 [pozadí] Extrahuji a ukládám vzpomínky...")
     try:
-        uc_se_z_zpravy(message, user_id, model=model)
+        uc_se_z_zpravy(zprava, user_id, model=model)
+        print("👉 [pozadí] Uložení paměti hotovo.")
     except Exception as e:
-        print(f"Paměť přeskočena z důvodu kvóty: {e}")
-
-    return odpoved
+        print(f"[pozadí] Paměť přeskočena: {e}")

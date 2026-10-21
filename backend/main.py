@@ -6,7 +6,7 @@ from __future__ import annotations
 from typing import Any, Optional
 from uuid import UUID
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -89,7 +89,7 @@ def health():
 
 
 @app.post("/api/chat", response_model=ChatResponse)
-def chat(req: ChatRequest):
+def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     user_id = req.user_id.strip().lower()
     mode = ai_engine.normalizuj_rezim(req.mode)
     message = req.message.strip()
@@ -105,6 +105,7 @@ def chat(req: ChatRequest):
 
     welcome_msg = None
     if not historie:
+        # Jednou za relaci — stejný kontext se předá do zpracuj_zpravu (bez 2. scrollu)
         _welcome_context[user_id] = db.posledni_vzpominky_texty(user_id, limit=10)
         welcome_msg = ai_engine.uvitaci_zprava(user_id)
         historie.append({"role": "assistant", "content": welcome_msg})
@@ -122,7 +123,6 @@ def chat(req: ChatRequest):
         )
     except ai_engine.GeminiVytizeneError as e:
         print(f"❌ DETEKTOVÁNA CHYBA GEMINI API: {type(e).__name__} - {e}")
-        # Uživatelsky přívětivá odpověď místo chybového JSON
         reply = str(e).strip() or ai_engine.HLASKA_API_NEDOSTUPNE
     except Exception as e:
         print(f"❌ DETEKTOVÁNA CHYBA GEMINI API: {type(e).__name__} - {e}")
@@ -136,6 +136,14 @@ def chat(req: ChatRequest):
             )
 
     historie.append({"role": "assistant", "content": reply})
+
+    # Extrakce faktů + zápis do Qdrantu/grafu až po odeslání odpovědi
+    background_tasks.add_task(
+        ai_engine.uc_se_na_pozadi,
+        message,
+        user_id,
+        req.model,
+    )
 
     return ChatResponse(
         user_id=user_id,
