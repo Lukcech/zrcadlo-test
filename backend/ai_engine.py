@@ -96,7 +96,7 @@ def teplota_pro_rezim(rezim: str) -> float:
     return 0.0 if rezim == REZIM_TREZOR else 0.6
 
 
-def formatuj_historii_chatu(zpravy: list[dict], limit: int = 5) -> str:
+def formatuj_historii_chatu(zpravy: list[dict], limit: int = 10) -> str:
     if not zpravy:
         return "Žádná předchozí konverzace v této relaci."
     casti = []
@@ -104,6 +104,34 @@ def formatuj_historii_chatu(zpravy: list[dict], limit: int = 5) -> str:
         role = "Uživatel" if msg.get("role") == "user" else "Zrcadlo"
         casti.append(f"{role}: {msg.get('content', '')}")
     return "\n".join(casti)
+
+
+def sestav_gemini_contents(
+    historie_chatu: list[dict],
+    aktualni_zprava: str,
+    limit: int = 10,
+) -> list:
+    """
+    Multi-turn contents pro Gemini API (role user/model).
+    Historie = předchozí zprávy; aktuální zpráva je poslední user turn.
+    """
+    contents: list = []
+    for msg in (historie_chatu or [])[-limit:]:
+        role_raw = (msg.get("role") or "").strip().lower()
+        text = (msg.get("content") or "").strip()
+        if not text:
+            continue
+        gemini_role = "user" if role_raw == "user" else "model"
+        contents.append(
+            types.Content(role=gemini_role, parts=[types.Part.from_text(text=text)])
+        )
+    contents.append(
+        types.Content(
+            role="user",
+            parts=[types.Part.from_text(text=(aktualni_zprava or "").strip())],
+        )
+    )
+    return contents
 
 
 def formatuj_chybu(exc: Exception) -> str:
@@ -195,13 +223,14 @@ def gemini_s_opakovanim(fn: Callable, pokusu: int = GEMINI_MAX_POKUSU):
 
 
 def generuj_text_s_retry_a_fallback(
-    prompt: str,
+    contents,
     model_name: str,
     teplota: float,
+    system_instruction: Optional[str] = None,
 ) -> str:
     """
-    Generování odpovědi: až 3 pokusy při 503/429 (pauza 1.5 s),
-    pak záložní model gemini-3.5-flash. Při totálním selhání vrátí českou hlášku.
+    Generování odpovědi (multi-turn contents): až 3 pokusy při 503/429,
+    pak záložní model. Při totálním selhání vrátí českou hlášku.
     """
     client = get_genai_client()
     primarni = _normalizuj_nazev_modelu(model_name or DEFAULT_MODEL)
@@ -210,13 +239,17 @@ def generuj_text_s_retry_a_fallback(
     if primarni != fallback:
         kandidati.append(fallback)
 
+    config_kwargs: dict = {"temperature": teplota}
+    if system_instruction:
+        config_kwargs["system_instruction"] = system_instruction
+
     for idx, model in enumerate(kandidati):
         for pokus in range(1, GEN_MAX_POKUSU + 1):
             try:
                 odpoved = client.models.generate_content(
                     model=model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(temperature=teplota),
+                    contents=contents,
+                    config=types.GenerateContentConfig(**config_kwargs),
                 )
                 text = (odpoved.text or "").strip() if odpoved else ""
                 if text:
@@ -306,11 +339,14 @@ def uvitaci_zprava(user_id: str) -> str:
 
 
 def uc_se_z_zpravy(zprava: str, user_id: str, model: Optional[str] = None) -> None:
-    """Extrahuje fakta a ukládá je do Qdrantu + SQLite grafu."""
+    """Extrahuje fakta a ukládá je do Qdrantu + SQLite grafu (s podrobným logováním)."""
+    uid = (user_id or "").strip().lower()
     model_name = vyber_model(model)
+    print(f"[Paměť] Extrakce start user_id={uid!r} model={model_name}")
+
     prompt = f"""
-Pokud zpráva obsahuje trvalé osobní fakta, preference, vztahy nebo tělesné/psychické prožitky, vyextrahuj je.
-Pokud zpráva neobsahuje žádná nová fakta (jen pozdrav, dotaz apod.), vrať prázdná pole.
+Pokud zpráva obsahuje trvalé osobní fakta, preference, vztahy, plány cest nebo tělesné/psychické prožitky uživatele, vyextrahuj je.
+Pokud zpráva neobsahuje žádná nová osobní fakta (jen pozdrav, obecný dotaz o světě apod.), vrať prázdná pole.
 
 Vrať JSON:
 - facts: pole věcných tvrzení o uživateli (3. osoba)
@@ -353,16 +389,25 @@ Zpráva:
             )
 
         odpoved = gemini_s_opakovanim(_call)
-        data = json.loads(odpoved.text)
+        data = json.loads(odpoved.text or "{}")
     except GeminiVytizeneError as e:
-        print(f"Paměť přeskočena z důvodu kvóty: {e}")
+        print(f"[Paměť] Extrakce SELHALA (kvóta/vytížení) user_id={uid!r}: {e}")
         return
     except Exception as e:
-        print(f"Paměť přeskočena z důvodu kvóty: {e}")
+        print(
+            f"[Paměť] Extrakce SELHALA user_id={uid!r}: "
+            f"{type(e).__name__}: {e}"
+        )
         return
 
-    fakta = data.get("facts", [])
-    trojice = data.get("triples", [])
+    fakta = [f for f in (data.get("facts") or []) if isinstance(f, str) and f.strip()]
+    trojice = data.get("triples") or []
+    print(f"[Paměť] Extrahovaná fakta ({len(fakta)}) pro user_id={uid!r}: {fakta}")
+    print(f"[Paměť] Extrahované triples ({len(trojice)}) pro user_id={uid!r}: {trojice}")
+
+    if not fakta and not trojice:
+        print(f"[Paměť] Nic k uložení (prázdná extrakce) user_id={uid!r}")
+        return
 
     if fakta:
         razitko = db.aktualni_razitko()
@@ -370,15 +415,75 @@ Zpráva:
         for f in fakta:
             text_s_casem = f"[{razitko}] {f}"
             try:
+                print(f"[Paměť] Embedding fakta: {text_s_casem!r}")
                 v = ziskej_embedding(text_s_casem)
+                body.append(db.vytvor_point(v, text_s_casem, uid))
             except Exception as e:
-                print(f"[Učení] Embedding selhal (soft): {e}")
+                print(
+                    f"[Paměť] Embedding SELHAL pro fakt {f!r} "
+                    f"user_id={uid!r}: {type(e).__name__}: {e}"
+                )
                 continue
-            body.append(db.vytvor_point(v, text_s_casem, user_id))
         if body:
-            db.uloz_vektory(body)
+            try:
+                ok = db.uloz_vektory(body, user_id=uid)
+                if ok:
+                    print(
+                        f"[Paměť] Qdrant UPSERT OK user_id={uid!r} "
+                        f"bodů={len(body)}"
+                    )
+                else:
+                    print(
+                        f"[Paměť] Qdrant UPSERT NEÚSPĚŠNÝ user_id={uid!r} "
+                        f"bodů={len(body)}"
+                    )
+            except Exception as e:
+                print(
+                    f"[Paměť] Qdrant UPSERT VÝJIMKA user_id={uid!r}: "
+                    f"{type(e).__name__}: {e}"
+                )
+        else:
+            print(f"[Paměť] Žádné body k upsertu (embeddingy selhaly) user_id={uid!r}")
 
-    db.uloz_trojice(user_id, trojice)
+    try:
+        db.uloz_trojice(uid, trojice)
+        print(f"[Paměť] Graf SQLite uložen user_id={uid!r} triples={len(trojice)}")
+    except Exception as e:
+        print(
+            f"[Paměť] Graf SQLite SELHAL user_id={uid!r}: "
+            f"{type(e).__name__}: {e}"
+        )
+
+
+def _spolecna_pravidla_chovani(user_id: str, je_prvni_zprava: bool) -> str:
+    pozdrav = (
+        "Toto je PRVNÍ zpráva relace — smíš krátce pozdravit."
+        if je_prvni_zprava
+        else (
+            "Konverzace už běží — NEZDRAV (žádné „Ahoj …“), "
+            "neopakuj jméno uživatele zbytečně, rovnou navazuj na téma."
+        )
+    )
+    return f"""
+Jsi Zrcadlo, AI průvodce uživatele '{user_id}'.
+
+CHOVÁNÍ:
+- {pozdrav}
+- Piš přirozeně, stručně a věcně. Žádné submisivní omluvy typu
+  „sypu si popel na hlavu“, „omlouvám se, že jsem to pokazil“.
+  Při upřesnění jen krátce oprav a pokračuj v tématu.
+- Drž se aktuálního tématu konverzace. Nenasazuj nesouvisející otázky
+  (např. ubytování, když uživatel řeší faunu).
+- Multi-turn: respektuj celou historii chatu (místa, jména, plány zmíněné dříve).
+
+ZNALOSTI O SVĚTĚ vs. OSOBNÍ FAKTA:
+- Encyklopedické znalosti (geografie, biologie, cestování, kultura…) POUŽÍVEJ VOLNĚ a přesně.
+- NIKDY nevymýšlej geografické/biologické nesmysly (např. pumy žijící divoce v Indii —
+  puma je americká; v Indii patří tygr, levhart atd.).
+- Zákaz vymýšlení („grounding“) platí POUZE pro osobní fakta o uživateli
+  (preference, vztahy, zdraví, majetek, plány). Ta ber JEN z paměti / historie chatu.
+  Pokud osobní fakt v paměti není, řekni to otevřeně — nevymýšlej.
+"""
 
 
 def generuj_odpoved(
@@ -390,40 +495,31 @@ def generuj_odpoved(
     rezim: str,
     uvitaci_kontext: Optional[list[str]] = None,
     model: Optional[str] = None,
+    je_prvni_zprava: bool = False,
 ) -> str:
     rezim = normalizuj_rezim(rezim)
     teplota = teplota_pro_rezim(rezim)
     model_name = vyber_model(model)
+    spolecna = _spolecna_pravidla_chovani(user_id, je_prvni_zprava)
 
     if rezim == REZIM_TREZOR:
-        pravidla = f"""
-Jsi Zrcadlo v režimu Striktní Trezor (NotebookLM) pro uživatele '{user_id}'.
-
-PRAVIDLA:
-- Odpovídej VÝHRADNĚ na základě nalezených paměťových faktů: vektorových vzpomínek a grafových vazeb.
-- Historii chatu používej jen k pochopení otázky, ne jako zdroj nových faktů.
-- Pokud informace v databázi (vzpomínkách / grafu) není, explicitně to přiznej, např.:
-  „Tuto informaci v databázi nemám.“
-- Nevymýšlej, nedoplňuj a neodvozuj nepodložené detaily.
-- Cituj nebo parafrázuj jen to, co je ve VEKTOROVÝCH VZPOMÍNKÁCH nebo GRAFOVÝCH VAZBÁCH.
-- Na začátku vzpomínek může být časové razítko [DD.MM.YYYY HH:MM] — ber ho v potaz.
-- UVÍTACÍ PAMĚŤOVÝ PŘEHLED používej jako obnovený kontext po restartu relace.
+        rezimova = f"""
+Režim: Striktní Trezor (NotebookLM).
+- Osobní fakta o uživateli: VÝHRADNĚ z vektorových vzpomínek a grafových vazeb.
+  Pokud osobní informace v paměti není: „Tuto informaci v databázi nemám.“
+- Světová/encyklopedická fakta smíš doplnit ze svých znalostí, pokud pomáhají
+  kontextu — ale ne jako náhradu za chybějící osobní data.
+- Historii chatu používej k pochopení otázky a kontinuity tématu.
 """
     else:
-        pravidla = f"""
-Jsi Zrcadlo, empatický AI průvodce (Kreativní parťák) uživatele '{user_id}'.
-
-PRAVIDLA:
-- Vycházej primárně ze zadaných faktů: vektorových vzpomínek, grafových vazeb a historie chatu.
-- Nevymýšlej si nepodložené detaily, události, jména ani pocity, které v podkladech nejsou.
-- Pokud něco nevíš, otevřeně to řekni. Nehalucinuj.
-- Na začátku vzpomínek může být časové razítko [DD.MM.YYYY HH:MM] — ber ho v potaz.
-- Odpovídej přátelsky, přímo a s pochopením a plynule navazuj na krátkodobou historii chatu.
-- UVÍTACÍ PAMĚŤOVÝ PŘEHLED obsahuje poslední vzpomínky načtené po restartu — navazuj na ně.
+        rezimova = f"""
+Režim: Kreativní parťák.
+- Odpovídej přátelsky a s pochopením, plynule navazuj na historii.
+- Osobní fakta o uživateli: jen z paměti / historie — nevymýšlej.
+- Světová témata (příroda, země, cestování…): využij své znalosti naplno a přesně.
 """
 
     uvitaci = uvitaci_kontext or []
-    # Uvítací texty jen v sekci UVÍTACÍ — nezdvojovat ve VEKTOROVÝCH VZPOMÍNKÁCH
     vektory_jedinecne = []
     videne = set(uvitaci)
     for text in vektory:
@@ -431,25 +527,34 @@ PRAVIDLA:
             vektory_jedinecne.append(text)
             videne.add(text)
 
-    prompt = f"""
-{pravidla}
+    system_instruction = f"""
+{spolecna}
+{rezimova}
 
-DOTAZ UŽIVATELE ({user_id}):
-{dotaz}
+PAMĚŤOVÝ KONTEXT uživatele '{user_id}' (osobní fakta):
+UVÍTACÍ PŘEHLED:
+{chr(10).join(uvitaci) if uvitaci else "Žádný."}
 
-KRÁTKODOBÁ PAMĚŤ (poslední zprávy tohoto chatu):
-{formatuj_historii_chatu(historie_chatu, limit=5)}
-
-UVÍTACÍ PAMĚŤOVÝ PŘEHLED (poslední vzpomínky po restartu):
-{chr(10).join(uvitaci) if uvitaci else "Žádný uvítací přehled."}
-
-VEKTOROVÉ VZPOMÍNKY (relevantní k dotazu, až 10):
-{chr(10).join(vektory_jedinecne) if vektory_jedinecne else "Žádné předchozí vzpomínky."}
+VEKTOROVÉ VZPOMÍNKY (relevantní k dotazu):
+{chr(10).join(vektory_jedinecne) if vektory_jedinecne else "Žádné."}
 
 GRAFOVÉ VAZBY:
-{chr(10).join(graf) if graf else "Žádné předchozí grafové vazby."}
+{chr(10).join(graf) if graf else "Žádné."}
+
+Časová razítka ve vzpomínkách mají tvar [DD.MM.YYYY HH:MM] — ber je v potaz.
 """
-    return generuj_text_s_retry_a_fallback(prompt, model_name, teplota)
+
+    contents = sestav_gemini_contents(historie_chatu, dotaz, limit=10)
+    print(
+        f"[Gemini] multi-turn turns={len(contents)} "
+        f"historie={len(historie_chatu)} prvni={je_prvni_zprava}"
+    )
+    return generuj_text_s_retry_a_fallback(
+        contents,
+        model_name,
+        teplota,
+        system_instruction=system_instruction.strip(),
+    )
 
 
 def zpracuj_zpravu(
@@ -459,23 +564,25 @@ def zpracuj_zpravu(
     historie_chatu: Optional[list[dict]] = None,
     uvitaci_kontext: Optional[list[str]] = None,
     model: Optional[str] = None,
+    je_prvni_zprava: bool = False,
     **kwargs,
 ) -> str:
-    """Chat pipeline: kontext → odpověď.
-    Učení (extrakce faktů) probíhá mimo — přes BackgroundTasks v main.py.
+    """Chat pipeline: kontext → multi-turn odpověď.
+    Učení probíhá přes BackgroundTasks v main.py.
     """
     if model is None and "model" in kwargs:
         model = kwargs.get("model")
+    if "je_prvni_zprava" in kwargs and not je_prvni_zprava:
+        je_prvni_zprava = bool(kwargs.get("je_prvni_zprava"))
 
     historie = list(historie_chatu or [])
-    # Načti uvítací kontext jen když volající nic nepředal (žádná duplicita s main.py)
     if uvitaci_kontext is None:
         uvitaci_kontext = db.posledni_vzpominky_texty(user_id, limit=10)
 
     print("👉 1/2: Vytvářím embedding dotazu a načítám kontext...")
     vektory, graf = ziskej_kontext(message, user_id)
 
-    print("👉 2/2: Generuji odpověď Zrcadla...")
+    print("👉 2/2: Generuji multi-turn odpověď Zrcadla...")
     return generuj_odpoved(
         message,
         vektory,
@@ -485,6 +592,7 @@ def zpracuj_zpravu(
         mode,
         uvitaci_kontext=uvitaci_kontext,
         model=model,
+        je_prvni_zprava=je_prvni_zprava or len(historie) == 0,
     )
 
 
@@ -492,9 +600,10 @@ def uc_se_na_pozadi(
     zprava: str, user_id: str, model: Optional[str] = None
 ) -> None:
     """Wrapper pro BackgroundTasks — chyby nesmí shodit worker."""
-    print("👉 [pozadí] Extrahuji a ukládám vzpomínky...")
+    uid = (user_id or "").strip().lower()
+    print(f"👉 [pozadí] Extrahuji a ukládám vzpomínky pro user_id={uid!r}...")
     try:
-        uc_se_z_zpravy(zprava, user_id, model=model)
-        print("👉 [pozadí] Uložení paměti hotovo.")
+        uc_se_z_zpravy(zprava, uid, model=model)
+        print(f"👉 [pozadí] Hotovo user_id={uid!r}")
     except Exception as e:
-        print(f"[pozadí] Paměť přeskočena: {e}")
+        print(f"[pozadí] Paměť SELHALA user_id={uid!r}: {type(e).__name__}: {e}")

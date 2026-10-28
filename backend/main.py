@@ -24,9 +24,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Krátkodobá paměť chatu na straně serveru (per user_id)
+# Záložní krátkodobá paměť na serveru (per user_id), primárně ale přijímáme history z frontendu
 _chat_histories: dict[str, list[dict]] = {}
 _welcome_context: dict[str, list[str]] = {}
+
+HISTORY_LIMIT = 10
+
+
+class ChatHistoryItem(BaseModel):
+    role: str = Field(..., description="user | assistant")
+    content: str = Field(..., min_length=1)
 
 
 class ChatRequest(BaseModel):
@@ -39,6 +46,10 @@ class ChatRequest(BaseModel):
     model: Optional[str] = Field(
         default=None,
         description="Volitelný Gemini model (např. gemini-3.5-flash-lite)",
+    )
+    history: Optional[list[ChatHistoryItem]] = Field(
+        default=None,
+        description="Posledních až 10 zpráv konverzace (role/content) z frontendu",
     )
 
 
@@ -88,6 +99,26 @@ def health():
     return {"status": "ok"}
 
 
+def _normalizuj_history(
+    items: Optional[list[ChatHistoryItem]],
+) -> list[dict]:
+    """Převede history z requestu na [{role, content}], max HISTORY_LIMIT."""
+    if not items:
+        return []
+    out: list[dict] = []
+    for item in items:
+        role = (item.role or "").strip().lower()
+        if role in ("assistant", "model", "zrcadlo"):
+            role = "assistant"
+        elif role != "user":
+            continue
+        content = (item.content or "").strip()
+        if not content:
+            continue
+        out.append({"role": role, "content": content})
+    return out[-HISTORY_LIMIT:]
+
+
 @app.post("/api/chat", response_model=ChatResponse)
 def chat(req: ChatRequest, background_tasks: BackgroundTasks):
     user_id = req.user_id.strip().lower()
@@ -101,25 +132,43 @@ def chat(req: ChatRequest, background_tasks: BackgroundTasks):
 
     if user_id not in _chat_histories:
         _chat_histories[user_id] = []
-    historie = _chat_histories[user_id]
+    server_historie = _chat_histories[user_id]
+
+    # Primárně historie z frontendu (multi-turn); jinak serverová záloha
+    client_historie = _normalizuj_history(req.history)
+    if client_historie:
+        historie_pro_model = client_historie
+        print(
+            f"[Chat] history z frontendu: {len(historie_pro_model)} zpráv "
+            f"(user_id={user_id!r})"
+        )
+    else:
+        historie_pro_model = list(server_historie)
+        print(
+            f"[Chat] history ze serveru: {len(historie_pro_model)} zpráv "
+            f"(user_id={user_id!r})"
+        )
 
     welcome_msg = None
-    if not historie:
-        # Jednou za relaci — stejný kontext se předá do zpracuj_zpravu (bez 2. scrollu)
+    je_prvni_zprava = len(historie_pro_model) == 0
+    if je_prvni_zprava and user_id not in _welcome_context:
         _welcome_context[user_id] = db.posledni_vzpominky_texty(user_id, limit=10)
         welcome_msg = ai_engine.uvitaci_zprava(user_id)
-        historie.append({"role": "assistant", "content": welcome_msg})
+        # Uvítání jen do UI / server store — do Gemini multi-turn necpeme jako falešný turn,
+        # pokud frontend ještě nic nemá; předáme ho jako součást system kontextu přes flag
+        server_historie.append({"role": "assistant", "content": welcome_msg})
 
-    historie.append({"role": "user", "content": message})
+    server_historie.append({"role": "user", "content": message})
 
     try:
         reply = ai_engine.zpracuj_zpravu(
             user_id=user_id,
             message=message,
             mode=mode,
-            historie_chatu=historie[:-1],
+            historie_chatu=historie_pro_model,
             uvitaci_kontext=_welcome_context.get(user_id, []),
             model=req.model,
+            je_prvni_zprava=je_prvni_zprava,
         )
     except ai_engine.GeminiVytizeneError as e:
         print(f"❌ DETEKTOVÁNA CHYBA GEMINI API: {type(e).__name__} - {e}")
@@ -129,15 +178,17 @@ def chat(req: ChatRequest, background_tasks: BackgroundTasks):
         if ai_engine.je_prechodna_gemini_chyba(e) or ai_engine.je_rate_limit_429(e):
             reply = ai_engine.HLASKA_API_NEDOSTUPNE
         else:
-            historie.pop()
+            server_historie.pop()
             raise HTTPException(
                 status_code=500,
                 detail=ai_engine.zprava_pro_uzivatele(e),
             )
 
-    historie.append({"role": "assistant", "content": reply})
+    server_historie.append({"role": "assistant", "content": reply})
+    # Udržuj serverovou zálohu v limitu
+    if len(server_historie) > HISTORY_LIMIT + 2:
+        _chat_histories[user_id] = server_historie[-(HISTORY_LIMIT + 2) :]
 
-    # Extrakce faktů + zápis do Qdrantu/grafu až po odeslání odpovědi
     background_tasks.add_task(
         ai_engine.uc_se_na_pozadi,
         message,
