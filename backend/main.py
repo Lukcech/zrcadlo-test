@@ -78,9 +78,7 @@ class DeleteMemoryResponse(BaseModel):
 
 
 def _parse_point_id(memory_id: str) -> Any:
-    """Qdrant očekává UUID/int; graph-<rowid> necháváme jako string."""
-    if memory_id.startswith("graph-"):
-        return memory_id
+    """Qdrant očekává UUID objekt nebo int."""
     try:
         return UUID(memory_id)
     except ValueError:
@@ -91,6 +89,7 @@ def _parse_point_id(memory_id: str) -> Any:
 
 @app.on_event("startup")
 def startup() -> None:
+    # Připraví Qdrant Cloud (nebo lokální path) — graf i vektory žijí v Qdrantu
     db.init_graph_db()
 
 
@@ -231,12 +230,13 @@ def list_memories(user_id: str = Query(..., min_length=1)):
 @app.delete("/api/memories/{memory_id}", response_model=DeleteMemoryResponse)
 def delete_memory(
     memory_id: str,
-    user_id: str = Query("", description="Volitelné user_id pro čištění grafu"),
+    user_id: str = Query("", description="Volitelné user_id (normalizované)"),
 ):
+    uid = user_id.strip().lower() if user_id else ""
     point_id = _parse_point_id(memory_id)
-    print(f"[API] DELETE /api/memories/{memory_id} user_id={user_id!r}")
+    print(f"[API] DELETE /api/memories/{memory_id} user_id={uid!r}")
     try:
-        db.smaz_vzpominku(point_id, user_id=user_id.strip().lower() if user_id else "")
+        db.smaz_vzpominku(point_id, user_id=uid)
     except Exception as e:
         print(f"[API] DELETE memory chyba: {e}")
         raise HTTPException(

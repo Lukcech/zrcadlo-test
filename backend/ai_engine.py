@@ -446,11 +446,20 @@ Zpráva:
             print(f"[Paměť] Žádné body k upsertu (embeddingy selhaly) user_id={uid!r}")
 
     try:
-        db.uloz_trojice(uid, trojice)
-        print(f"[Paměť] Graf SQLite uložen user_id={uid!r} triples={len(trojice)}")
+        ok_graf = db.uloz_trojice(uid, trojice)
+        if ok_graf:
+            print(
+                f"[Paměť] Graf Qdrant uložen user_id={uid!r} "
+                f"triples={len(trojice)}"
+            )
+        else:
+            print(
+                f"[Paměť] Graf Qdrant NEÚSPĚŠNÝ/prázdný user_id={uid!r} "
+                f"triples={len(trojice)}"
+            )
     except Exception as e:
         print(
-            f"[Paměť] Graf SQLite SELHAL user_id={uid!r}: "
+            f"[Paměť] Graf Qdrant SELHAL user_id={uid!r}: "
             f"{type(e).__name__}: {e}"
         )
 
