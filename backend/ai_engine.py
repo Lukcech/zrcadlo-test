@@ -285,22 +285,30 @@ def generuj_text_s_retry_a_fallback(
 
 
 def ziskej_embedding(text: str) -> list[float]:
-    """Vektorový otisk přes gemini-embedding-001 (dim 3072 dle test_step_by_step)."""
+    """
+    Vektorový otisk přes gemini-embedding-001.
+    Dimense = rozměr Qdrant kolekce (typicky 768, Matryoshka output_dimensionality).
+    """
     client = get_genai_client()
+    cilova = db.cilova_dimenze()
 
     def _call():
         vysledek = client.models.embed_content(
             model=db.EMBED_MODEL,
             contents=text,
+            config=types.EmbedContentConfig(output_dimensionality=cilova),
         )
         values = list(vysledek.embeddings[0].values)
         if not values:
             raise RuntimeError("Embedding vrátil prázdný vektor.")
-        if len(values) != db.EMBED_DIM:
-            raise RuntimeError(
-                f"Embedding má dimenzi {len(values)}, očekáváno {db.EMBED_DIM}."
+        # Pojistka: ořez + L2 (i kdyby API vrátilo plných 3072)
+        upraveny = db.uprav_dimensi_vektoru(values, cilova)
+        if len(values) != cilova:
+            print(
+                f"[Embedding] Upraveno dim {len(values)} → {len(upraveny)} "
+                f"(kolekce={cilova})"
             )
-        return values
+        return upraveny
 
     return gemini_s_opakovanim(_call)
 

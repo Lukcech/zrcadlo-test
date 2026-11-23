@@ -24,9 +24,10 @@ from qdrant_client.models import Distance, VectorParams
 ROOT = _ROOT
 DB_PATH = str(ROOT / "qdrant_db")
 QDRANT_COLLECTION = "zrcadlo_pamet"
-# Ověřeno test_step_by_step: gemini-embedding-001 → dim 3072
+# gemini-embedding-001 umí Matryoshka; produkční kolekce zrcadlo_pamet má dim 768
 EMBED_MODEL = "gemini-embedding-001"
-EMBED_DIM = 3072
+EMBED_DIM_DEFAULT = 768
+EMBED_DIM = EMBED_DIM_DEFAULT  # runtime se synchronizuje s rozměrem kolekce
 
 MEMORY_TYPE_VECTOR = "vector"
 MEMORY_TYPE_GRAPH = "graph"
@@ -38,6 +39,7 @@ DB_CEKANI_S = 2
 _qdrant_client: Optional[QdrantClient] = None
 _qdrant_client_lock = threading.Lock()
 _qdrant_mode: Optional[str] = None  # "cloud" | "local"
+_collection_vector_size: Optional[int] = None
 
 
 def _env_qdrant() -> tuple[str, str]:
@@ -61,6 +63,116 @@ def _env_qdrant() -> tuple[str, str]:
 
 def normalizuj_user_id(user_id: str) -> str:
     return (user_id or "").strip().lower()
+
+
+def uprav_dimensi_vektoru(
+    vektor: list[float], cilova_delka: int = EMBED_DIM_DEFAULT
+) -> list[float]:
+    """
+    Matryoshka pojistka: ořízne/doplní vektor na cílovou délku a L2-normalizuje.
+    Prvních N dimenzí Gemini embeddingů je validních.
+    """
+    if cilova_delka <= 0:
+        raise ValueError(f"Neplatná cílová dimenze: {cilova_delka}")
+    values = list(vektor or [])
+    if len(values) > cilova_delka:
+        values = values[:cilova_delka]
+    elif len(values) < cilova_delka:
+        values = values + [0.0] * (cilova_delka - len(values))
+
+    norma = sum(x * x for x in values) ** 0.5
+    if norma > 0:
+        values = [x / norma for x in values]
+    else:
+        # ne-nulový placeholder (cosine)
+        values = [0.0] * cilova_delka
+        values[0] = 1.0
+    return values
+
+
+def _extrahuj_vector_size(vectors_cfg: Any) -> Optional[int]:
+    """Z config.params.vectors vytáhne .size (objekt i dict)."""
+    if vectors_cfg is None:
+        return None
+    if isinstance(vectors_cfg, dict):
+        # pojmenované vektory: {"default": {"size": 768}, ...} nebo {"size": 768}
+        if "size" in vectors_cfg:
+            try:
+                return int(vectors_cfg["size"])
+            except (TypeError, ValueError):
+                return None
+        for val in vectors_cfg.values():
+            size = _extrahuj_vector_size(val)
+            if size:
+                return size
+        return None
+    size = getattr(vectors_cfg, "size", None)
+    if size is not None:
+        try:
+            return int(size)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def zjisti_dimenzi_kolekce(client: Optional[QdrantClient] = None) -> int:
+    """
+    Skutečná dimenze kolekce zrcadlo_pamet z Qdrantu.
+    Fallback 768 — kolekci NESMAZUJE.
+    """
+    global EMBED_DIM, _collection_vector_size
+    if _collection_vector_size:
+        return _collection_vector_size
+
+    try:
+        c = client or get_qdrant_client()
+        info = c.get_collection(QDRANT_COLLECTION)
+        vectors_cfg = None
+        try:
+            vectors_cfg = info.config.params.vectors
+        except Exception:
+            # dict-like / starší klient
+            cfg = getattr(info, "config", None) or {}
+            if isinstance(cfg, dict):
+                params = cfg.get("params") or {}
+                vectors_cfg = (
+                    params.get("vectors")
+                    if isinstance(params, dict)
+                    else getattr(params, "vectors", None)
+                )
+            else:
+                params = getattr(cfg, "params", None)
+                vectors_cfg = getattr(params, "vectors", None) if params else None
+
+        size = _extrahuj_vector_size(vectors_cfg)
+        if size and size > 0:
+            _collection_vector_size = size
+            EMBED_DIM = size
+            print(f"[Qdrant] Dimense kolekce '{QDRANT_COLLECTION}': {size}")
+            return size
+        print(
+            f"[Qdrant] Dimensi kolekce se nepodařilo přečíst "
+            f"(vectors={vectors_cfg!r}) — fallback {EMBED_DIM_DEFAULT}"
+        )
+    except Exception as e:
+        print(
+            f"[Qdrant] zjisti_dimenzi_kolekce: {type(e).__name__}: {e} "
+            f"— fallback {EMBED_DIM_DEFAULT}"
+        )
+
+    _collection_vector_size = EMBED_DIM_DEFAULT
+    EMBED_DIM = EMBED_DIM_DEFAULT
+    return EMBED_DIM_DEFAULT
+
+
+def cilova_dimenze() -> int:
+    """Aktuální cílová dimenze pro embeddingy / upsert (kolekce nebo 768)."""
+    if _collection_vector_size:
+        return _collection_vector_size
+    try:
+        return zjisti_dimenzi_kolekce()
+    except Exception:
+        return EMBED_DIM_DEFAULT
 
 
 def vytvor_qdrant_client() -> QdrantClient:
@@ -117,7 +229,11 @@ def zajisti_payload_indexy(client: QdrantClient) -> None:
 
 
 def zajisti_kolekci(client: QdrantClient) -> None:
-    """Vytvoří kolekci zrcadlo_pamet, pokud ještě neexistuje."""
+    """
+    Zajistí kolekci zrcadlo_pamet.
+    Existující kolekci NIKDY nemaže ani nepřegenerovává (zachová uložené body).
+    """
+    global EMBED_DIM, _collection_vector_size
     existuje = False
     try:
         if hasattr(client, "collection_exists"):
@@ -129,14 +245,23 @@ def zajisti_kolekci(client: QdrantClient) -> None:
         print(f"[Qdrant] Kontrola kolekce selhala: {type(e).__name__}: {e}")
         existuje = False
 
-    if not existuje:
+    if existuje:
+        dim = zjisti_dimenzi_kolekce(client)
+        print(
+            f"[Qdrant] Kolekce '{QDRANT_COLLECTION}' existuje — "
+            f"ponechána beze změny (dim={dim})."
+        )
+    else:
+        dim = EMBED_DIM_DEFAULT
         client.create_collection(
             collection_name=QDRANT_COLLECTION,
-            vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
+            vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
         )
+        _collection_vector_size = dim
+        EMBED_DIM = dim
         print(
             f"[Qdrant] Kolekce '{QDRANT_COLLECTION}' vytvořena "
-            f"(dim={EMBED_DIM}, COSINE)."
+            f"(dim={dim}, COSINE)."
         )
 
     zajisti_payload_indexy(client)
@@ -220,8 +345,12 @@ def init_graph_db() -> None:
     try:
         client = get_qdrant_client()
         zajisti_kolekci(client)
+        dim = cilova_dimenze()
         mode = _qdrant_mode or "?"
-        print(f"[Paměť] init OK mode={mode} collection={QDRANT_COLLECTION}")
+        print(
+            f"[Paměť] init OK mode={mode} collection={QDRANT_COLLECTION} "
+            f"vector_size={dim}"
+        )
     except Exception as e:
         print(f"[Paměť] init SELHAL: {type(e).__name__}: {e}")
         raise
@@ -239,8 +368,9 @@ def rozdel_razitko_a_text(text: str) -> tuple[str, str]:
 
 
 def _placeholder_vector() -> list[float]:
-    """Stabilní ne-nulový vektor pro graph body (nepoužívají se v sémantickém search)."""
-    v = [0.0] * EMBED_DIM
+    """Stabilní ne-nulový vektor přesné délky kolekce pro graph body."""
+    dim = cilova_dimenze()
+    v = [0.0] * dim
     v[0] = 1.0
     return v
 
@@ -315,11 +445,17 @@ def _payload_user_id(payload: dict) -> str:
 
 
 def _payload_memory_type(payload: dict) -> str:
+    """
+    Chybějící memory_type u starších bodů = výchozí \"vector\"
+    (zpětná kompatibilita ~47 bodů pro karel apod.).
+    """
     if not payload:
         return MEMORY_TYPE_VECTOR
+    if "memory_type" not in payload or payload.get("memory_type") in (None, ""):
+        return MEMORY_TYPE_VECTOR
     val = payload.get("memory_type")
-    if val in (MEMORY_TYPE_GRAPH, MEMORY_TYPE_VECTOR):
-        return str(val)
+    if val == MEMORY_TYPE_GRAPH:
+        return MEMORY_TYPE_GRAPH
     return MEMORY_TYPE_VECTOR
 
 
@@ -698,9 +834,11 @@ def posledni_vzpominky_texty(user_id: str, limit: int = 10) -> list[str]:
 
 def vytvor_point(vektor: list[float], text: str, user_id: str):
     uid = normalizuj_user_id(user_id)
+    dim = cilova_dimenze()
+    vec = uprav_dimensi_vektoru(vektor, dim)
     return models.PointStruct(
         id=str(uuid.uuid4()),
-        vector=vektor,
+        vector=vec,
         payload={
             "text": text,
             "user_id": uid,
@@ -717,10 +855,13 @@ def vytvor_graph_point(
     object_: str,
 ):
     uid = normalizuj_user_id(user_id)
+    dim = cilova_dimenze()
+    raw = vektor if vektor else _placeholder_vector()
+    vec = uprav_dimensi_vektoru(raw, dim)
     text = f"[{subject}] -> ({relation}) -> [{object_}]"
     return models.PointStruct(
         id=str(uuid.uuid4()),
-        vector=vektor if vektor else _placeholder_vector(),
+        vector=vec,
         payload={
             "text": text,
             "user_id": uid,
